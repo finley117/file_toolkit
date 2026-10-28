@@ -1,0 +1,27 @@
+# 构建产物
+dist/
+_stage/
+build_*/
+*.spec
+
+# 运行产物
+media_index.db
+*.db-journal
+*.db-wal
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# 工具配置
+.workbuddy/
