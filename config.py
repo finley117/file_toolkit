@@ -1,7 +1,8 @@
 """配置层：config.json 读写。
 
-服务照片重命名页签（photo 段）与关键字整理页签（dedup 段）。其余页签的参数
-暂不接入——它们本来就没有持久化，见 TODO 的 D-08。
+四个页签各占一段：app（共用条与窗口）、checker（查重清理）、dedup（查重(关键字)）、
+photo（照片重命名）。没有"恢复默认"按钮——想让某项回到初始，直接删掉 config.json
+（文件不存在时全部走 DEFAULTS）。
 
 设计要点：
 - 缺失或损坏一律返回默认值，不抛异常，保证主程序能起来
@@ -18,6 +19,21 @@ CONFIG_NAME = "config.json"
 
 DEFAULTS = {
     "version": 1,
+    "app": {
+        "algo": "xxh3-128",
+        "workers": 4,
+        "geometry": "",
+        "last_tab": 0,
+        "ffprobe_path": "",
+    },
+    "checker": {
+        "base": "",
+        "extra": "",
+        "out": "",
+        "min_kb": 1,
+        "hidden": False,
+        "only_extra": True,
+    },
     "photo": {
         "source_dir": "",
         "template": "{type}_{date}_{time}",
@@ -28,6 +44,11 @@ DEFAULTS = {
     },
     "dedup": {
         "keyword_rule": "",
+        "src": "",
+        "dst": "",
+        "quar": "",
+        "min_kb": 0,
+        "keep": "最早优先",
     },
 }
 

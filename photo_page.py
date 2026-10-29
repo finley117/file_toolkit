@@ -89,7 +89,8 @@ class PhotoPage:
         self.btn_scan.pack(side="left")
         self.btn_stop = ttk.Button(btns, text="停止", width=6, command=self._on_stop, state="disabled")
         self.btn_stop.pack(side="left", padx=(6, 8))
-        self.btn_apply = ttk.Button(btns, text="② 执行计划", command=self._on_apply, state="disabled")
+        self.btn_apply = ttk.Button(btns, text="② 执行计划", style="Write.TButton",
+                                    command=self._on_apply, state="disabled")
         self.btn_apply.pack(side="left", padx=8)
         self.btn_open = ttk.Button(btns, text="打开报告目录", command=self.open_plan_dir,
                                    state="disabled")

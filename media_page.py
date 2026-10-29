@@ -1,14 +1,17 @@
+import csv
 import os
 import re
 import subprocess
 import threading
 import traceback
 import tkinter as tk
+from datetime import datetime
 from tkinter import ttk, filedialog, messagebox, simpledialog
 
 import media_db as db
 import media_query
 import media_scanner as scanner
+from fsops import transfer
 
 
 class MediaPage:
@@ -57,13 +60,15 @@ class MediaPage:
         self.btn_dup.pack(side='left', padx=2)
         self.btn_export = ttk.Button(frm, text='导出CSV', command=self.export_csv)
         self.btn_export.pack(side='left', padx=2)
-        self.btn_rename_files = ttk.Button(frm, text='重命名文件', command=self.rename_files,
-                                           state='disabled')
+        self.btn_rename_files = ttk.Button(frm, text='重命名文件', style='Write.TButton',
+                                           command=self.rename_files, state='disabled')
         self.btn_rename_files.pack(side='left', padx=2)
-        self.btn_rename_dirs = ttk.Button(frm, text='重命名文件夹', command=self.rename_folders,
-                                          state='disabled')
+        self.btn_rename_dirs = ttk.Button(frm, text='重命名文件夹', style='Write.TButton',
+                                          command=self.rename_folders, state='disabled')
         self.btn_rename_dirs.pack(side='left', padx=2)
-        ttk.Button(frm, text='清理失效', command=self.prune_all).pack(side='left', padx=2)
+        self.btn_prune = ttk.Button(frm, text='清理失效', style='Write.TButton',
+                                    command=self.prune_all)
+        self.btn_prune.pack(side='left', padx=2)
         ttk.Label(frm, text='关键字正则:').pack(side='left', padx=(15, 2))
         self.rule_entry = ttk.Entry(frm, width=22)
         self.rule_entry.pack(side='left')
@@ -282,6 +287,8 @@ class MediaPage:
             self._show_rows([], '查重结果 (单击关键字展开, 双击/右键打开所在文件夹)')
 
     def export_csv(self):
+        if self._busy_guard():
+            return
         c = db.conn()
         try:
             dups = db.find_duplicates(c)
@@ -381,6 +388,8 @@ class MediaPage:
         return any(p.lower() in scanner.SKIP_DIRS for p in parts)
 
     def rename_files(self):
+        if self._busy_guard():
+            return
         entries = self._collect_entries()
         if not entries:
             return
@@ -411,34 +420,47 @@ class MediaPage:
         if not todo:
             messagebox.showinfo('提示', '没有需要重命名的文件')
             return
-        sample = '\n'.join(os.path.basename(t) for _, t, _ in todo[:8])
-        if not messagebox.askyesno('确认重命名文件',
-                                   '将重命名 %d 个文件为「关键字.后缀」:\n\n%s%s\n\n继续?' % (
-                                       len(todo), sample, '\n...' if len(todo) > 8 else '')):
+        pairs = ['%s\n    -> %s' % (os.path.basename(fp), os.path.basename(t))
+                 for fp, t, _ in todo[:20]]
+        rest = len(todo) - len(pairs)
+        if not messagebox.askyesno(
+                '确认重命名文件',
+                '将重命名 %d 个文件（另有 %d 个因多关键字/系统目录被跳过）：\n\n%s%s\n\n'
+                '执行后完整清单会写入台账文件。\n继续?' % (
+                    len(todo), ambiguous, '\n'.join(pairs),
+                    '\n... 还有 %d 条' % rest if rest > 0 else '')):
             return
         c = db.conn()
         renamed = skipped = failed = 0
+        records = []
         try:
             for fp, target, word in todo:
+                stamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 if os.path.exists(target):
                     skipped += 1
+                    records.append([stamp, '重命名文件', fp, target, word, '跳过', '目标已存在'])
                     self.log_msg('跳过(目标已存在): ' + target)
                     continue
-                try:
-                    os.rename(fp, target)
-                except OSError as e:
+                ok, why = transfer(fp, target)
+                if not ok:
                     failed += 1
-                    self.log_msg('重命名失败: %s (%s)' % (fp, e))
+                    records.append([stamp, '重命名文件', fp, target, word, '失败', why])
+                    self.log_msg('重命名失败: %s (%s)' % (fp, why))
                     continue
                 db.rename_file_to_keyword(c, fp, target, word)
                 renamed += 1
+                records.append([stamp, '重命名文件', fp, target, word, '成功', ''])
         finally:
             c.close()
-        self.log_msg('文件重命名完成: 成功 %d, 跳过 %d, 失败 %d, 多关键字跳过 %d' % (
-            renamed, skipped, failed, ambiguous))
+        ledger = self._write_ledger('重命名文件', records)
+        self.log_msg('文件重命名完成: 成功 %d, 跳过 %d, 失败 %d, 多关键字跳过 %d%s' % (
+            renamed, skipped, failed, ambiguous,
+            ('，台账: %s' % ledger) if ledger else ''))
         self._reload_view()
 
     def rename_folders(self):
+        if self._busy_guard():
+            return
         entries = self._collect_entries()
         if not entries:
             return
@@ -481,31 +503,41 @@ class MediaPage:
         if not todo:
             messagebox.showinfo('提示', '没有可重命名的文件夹')
             return
-        sample = '\n'.join(os.path.basename(d) + '  ->  ' + os.path.basename(t)
-                           for d, t in todo[:8])
-        if not messagebox.askyesno('确认重命名文件夹',
-                                   '将重命名 %d 个文件夹为对应关键字:\n\n%s%s\n\n继续?' % (
-                                       len(todo), sample, '\n...' if len(todo) > 8 else '')):
+        pairs = ['%s  ->  %s' % (os.path.basename(d), os.path.basename(t))
+                 for d, t in todo[:60]]
+        rest = len(todo) - len(pairs)
+        if not messagebox.askyesno(
+                '确认重命名文件夹',
+                '将重命名 %d 个文件夹（另有 %d 个跳过）：\n\n%s%s\n\n'
+                '改名会影响目录下所有文件的路径记录，完整清单会写入台账。\n继续?' % (
+                    len(todo), skipped, '\n'.join(pairs),
+                    '\n... 还有 %d 条' % rest if rest > 0 else '')):
             return
         c = db.conn()
         renamed = failed = 0
+        records = []
         try:
             for d, target in sorted(todo, key=lambda x: x[0].count(os.sep), reverse=True):
+                stamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 if os.path.exists(target):
                     skipped += 1
+                    records.append([stamp, '重命名文件夹', d, target, '', '跳过', '目标已存在'])
                     self.log_msg('跳过(目标已存在): ' + target)
                     continue
-                try:
-                    os.rename(d, target)
-                except OSError as e:
+                ok, why = transfer(d, target)
+                if not ok:
                     failed += 1
-                    self.log_msg('文件夹重命名失败: %s (%s)' % (d, e))
+                    records.append([stamp, '重命名文件夹', d, target, '', '失败', why])
+                    self.log_msg('文件夹重命名失败: %s (%s)' % (d, why))
                     continue
                 db.rename_folder(c, d, target)
                 renamed += 1
+                records.append([stamp, '重命名文件夹', d, target, '', '成功', ''])
         finally:
             c.close()
-        self.log_msg('文件夹重命名完成: 成功 %d, 跳过 %d, 失败 %d' % (renamed, skipped, failed))
+        ledger = self._write_ledger('重命名文件夹', records)
+        self.log_msg('文件夹重命名完成: 成功 %d, 跳过 %d, 失败 %d%s' % (
+            renamed, skipped, failed, ('，台账: %s' % ledger) if ledger else ''))
         self._refresh_paths()
         self._reload_view()
 
@@ -545,6 +577,8 @@ class MediaPage:
         self._reload_view()
 
     def prune_all(self):
+        if self._busy_guard():
+            return
         c = db.conn()
         removed, skipped = db.prune_missing(c)
         c.close()
@@ -735,11 +769,41 @@ class MediaPage:
 
     def set_enabled(self, flag):
         state = 'normal' if flag else 'disabled'
+        for w in (self.btn_add, self.btn_dup, self.btn_rule, self.btn_export):
+            try:
+                w.config(state=state)
+            except Exception:
+                pass
         try:
-            self.btn_add.config(state=state)
-            self.btn_dup.config(state=state)
-            self.btn_rule.config(state=state)
-            if not flag:
+            if flag:
+                self._update_action_buttons()   # 重命名按钮按"是否选中路径"恢复
+            else:
+                self.btn_rename_files.config(state='disabled')
+                self.btn_rename_dirs.config(state='disabled')
+                self.btn_prune.config(state='disabled')
                 self.btn_stop.config(state='disabled')
         except Exception:
             pass
+
+    def _busy_guard(self):
+        """写盘类操作的统一闸门：别的页签在跑任务时直接拦住。"""
+        if self.app.busy:
+            messagebox.showinfo('提示', '另一个任务正在运行，等它结束后再操作')
+            return True
+        return False
+
+    def _write_ledger(self, action, records):
+        """把本次明细写成 CSV（放在索引库同级目录），返回路径或 None。"""
+        if not records:
+            return None
+        path = os.path.join(os.path.dirname(db.db_path()),
+                            '%s台账_%s.csv' % (action, datetime.now().strftime('%Y%m%d_%H%M%S')))
+        try:
+            with open(path, 'w', newline='', encoding='utf-8-sig') as f:
+                w = csv.writer(f)
+                w.writerow(['时间', '动作', '原路径', '新路径', '关键字', '结果', '说明'])
+                w.writerows(records)
+        except OSError as e:
+            self.log_msg('台账写入失败: %s' % e)
+            return None
+        return path

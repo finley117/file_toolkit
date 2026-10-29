@@ -18,6 +18,15 @@ python -m pip install xxhash pillow-heif piexif exifread
 
 ## 构建命令
 
+**推荐直接用脚本**（自动读 `VER`、校验 CHANGELOG、保护 `dist` 里的运行数据）：
+
+```bat
+python run_tests.py     :: 先跑回归，40 项全绿再打包
+python build.py         :: 只打 onedir；加 --onefile 同时打 onefile；加 --smoke 打完全自动启一次
+```
+
+下面是等价的手工命令，便于排查问题。
+
 **必须带三个 `--hidden-import`**：`piexif` / `exifread` / `PIL.Image` 在代码里是函数内懒加载的，
 PyInstaller 的静态分析发现不了，不加会在运行时 `ImportError`。
 
@@ -66,7 +75,8 @@ dist/
   `D:` 盘请用 onedir 版
 - `--windowed` 的产物没有控制台，stdout 不可见；启动异常会弹错误框，运行期问题见各页签日志区
 - `dist\media_index.db` 若来自冒烟测试可删，首次运行会自动在 exe 同级重建
-- `dist\config.json` 是照片重命名页的配置，可删，首次运行自动创建
+- `dist\config.json` 是四个页签的配置（算法/线程/窗口/上次页签/各页路径与选项），可删，
+  删除后全部回到默认值，首次运行时自动创建
 - 重新打包不会继承签名，**每次打包后需重新签名**（若已启用代码签名）
 
 ## 冒烟验证

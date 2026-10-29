@@ -82,9 +82,10 @@ media_query.py         # CSV 导出
 photo_page.py          # 照片重命名页
 photo_rename.py        # 模板校验、命名生成、计划与执行
 photo_media.py         # EXIF / HEIC / 视频元数据提取
-config.py              # config.json 读写（照片页配置）
-dedup_tool.py          # 合并前的整理工具（行为对照用）
-same_file_checker.py   # 合并前的查重工具（行为对照用）
+config.py              # config.json 读写（四个页签的配置都存这里）
+fsops.py               # 移动/复制原语 + 长路径封装（四个页签共用）
+build.py               # 一键打包（读版本号、校验 CHANGELOG、保护 dist 里的运行数据）
+run_tests.py           # 回归测试（不启动界面，40 项核心逻辑检查）
 ```
 
 ## 文档

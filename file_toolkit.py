@@ -20,6 +20,8 @@ from datetime import datetime
 from pathlib import Path
 
 import config
+import photo_media
+from fsops import long_path as _long, transfer
 from media_page import MediaPage
 from photo_page import PhotoPage
 
@@ -52,19 +54,6 @@ DEFAULT_ALGO = "xxh3-128" if xxhash is not None else "MD5"
 _bench_buf = None
 
 
-def _long(path):
-    if os.name != "nt":
-        return path
-    p = os.path.abspath(path)
-    if p.startswith("\\\\?\\"):
-        return p
-    if len(p) < 240:
-        return p
-    if p.startswith("\\\\"):
-        return "\\\\?\\UNC\\" + p[2:]
-    return "\\\\?\\" + p
-
-
 def human_size(n):
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if n < 1024 or unit == "TB":
@@ -92,6 +81,40 @@ def _overlap(a, b):
 def _is_drive_root(path):
     p = os.path.abspath(path).rstrip("\\/")
     return len(p) <= 2 or p.endswith(":")
+
+
+def preflight(dst, sources, dst_label="目标目录", must_be_empty=False, need_bytes=None):
+    """收集"会阻止执行"的问题；返回列表，空列表表示可以执行。
+
+    sources 是 [(标签, 路径), ...]，用来检查目标目录不能与来源目录相同或互相包含。
+    各页签只声明自己的要求，不再各写一套判断。
+    """
+    if not dst:
+        return ["没有指定%s" % dst_label]
+    dst_abs = os.path.abspath(dst)
+    problems = []
+    if must_be_empty and _is_drive_root(dst_abs):
+        problems.append("%s不能是盘根：%s" % (dst_label, dst_abs))
+    for label, path in sources:
+        if not path:
+            continue
+        if _norm(path) == _norm(dst_abs):
+            problems.append("「%s」与「%s」不能是同一个目录" % (dst_label, label))
+        elif _overlap(dst_abs, path):
+            problems.append("「%s」与「%s」不能互相包含（一个是另一个的子目录）"
+                            % (dst_label, label))
+    if must_be_empty and os.path.isdir(dst_abs) and os.listdir(dst_abs):
+        problems.append("%s必须为空：%s" % (dst_label, dst_abs))
+    if need_bytes is not None:
+        try:
+            free = shutil.disk_usage(dst_abs).free
+        except OSError as e:
+            problems.append("%s不可用：%s" % (dst_label, e))
+        else:
+            if free < need_bytes:
+                problems.append("%s所在盘空间不足：需要 %s，可用 %s"
+                                % (dst_label, human_size(need_bytes), human_size(free)))
+    return problems
 
 
 def _unique_path(folder, name):
@@ -323,25 +346,25 @@ def checker_execute(plan, dst, stop, on_progress, algo, only_extra):
             continue
         manifest.append(f"[组{gi}] 哈希 {g['hash']}  大小 {human_size(g['size'])}  份数 {len(g['members'])}")
         manifest.append(f"  保留: [{'基础' if kept['src'] == SRC_BASE else '额外'}] {kept['path']}")
-        try:
-            ktarget = _unique_path(folder, "[保留] " + os.path.basename(kept["path"]))
-            shutil.copy2(_long(kept["path"]), _long(ktarget))
+        ktarget = _unique_path(folder, "[保留] " + os.path.basename(kept["path"]))
+        good, why = transfer(kept["path"], ktarget, "copy")
+        if good:
             copied += 1
             manifest.append(f"  副本: {ktarget}")
-        except OSError as e:
-            manifest.append(f"  副本失败: {e}")
+        else:
+            manifest.append(f"  副本失败: {why}")
         for m in moves:
             if stop.is_set():
                 break
             tag = "基础" if m["src"] == SRC_BASE else "额外"
-            try:
-                target = _unique_path(folder, os.path.basename(m["path"]))
-                shutil.move(_long(m["path"]), _long(target))
+            target = _unique_path(folder, os.path.basename(m["path"]))
+            good, why = transfer(m["path"], target)
+            if good:
                 ok += 1
                 manifest.append(f"  待删[{tag}]: {m['path']}\n     -> {target}")
-            except OSError as e:
+            else:
                 fail += 1
-                manifest.append(f"  待删[{tag}]: {m['path']}\n     -> 失败: {e}")
+                manifest.append(f"  待删[{tag}]: {m['path']}\n     -> 失败: {why}")
             done += 1
             on_progress(done, total)
         manifest.append("")
@@ -495,19 +518,17 @@ def dedup_execute(rows, dst, quarantine, on_log=print, on_progress=None, cancel=
         base = quarantine if r["动作"] == "隔离" else dst
         src_path = r["源路径"]
         target = os.path.join(base, r["文件名"])
-        try:
-            if not os.path.isfile(_long(src_path)):
-                raise FileNotFoundError("源文件已不存在")
-            if os.path.exists(_long(target)):
-                skipped += 1
-                on_log(f"[i] 跳过（目标已有同名）：{r['文件名']}")
-                continue
-            shutil.move(_long(src_path), _long(target))
+        if os.path.exists(_long(target)):
+            skipped += 1
+            on_log(f"[i] 跳过（目标已有同名）：{r['文件名']}")
+            continue
+        good, why = transfer(src_path, target)
+        if good:
             moved += 1
-        except Exception as e:
+        else:
             failed += 1
-            errors.append({"源路径": src_path, "错误": str(e)})
-            on_log(f"[!] 失败 {r['文件名']}：{e}")
+            errors.append({"源路径": src_path, "错误": why})
+            on_log(f"[!] 失败 {r['文件名']}：{why}")
         if on_progress and (i % 50 == 0 or i == total):
             on_progress(i, total)
     stopped = bool(cancel is not None and cancel.is_set())
@@ -539,6 +560,7 @@ class CheckerPage:
         self.started = 0.0
         self._reset_sel()
         self._build(parent)
+        self._load_cfg()
 
     def _build(self, parent):
         ttk, tk = self.ttk, self.tk
@@ -605,7 +627,7 @@ class CheckerPage:
                    command=lambda: self._set_all(True)).pack(side="left", padx=(8, 0))
         ttk.Button(bottom, text="全不选", width=7,
                    command=lambda: self._set_all(False)).pack(side="left", padx=6)
-        self.btn_remove = ttk.Button(bottom, text="移除", width=8,
+        self.btn_remove = ttk.Button(bottom, text="移除", width=8, style="Write.TButton",
                                      command=self._do_remove, state="disabled")
         self.btn_remove.pack(side="left")
 
@@ -614,6 +636,13 @@ class CheckerPage:
 
         self.log = tk.Text(wrap, height=6, wrap="word", font=("Consolas", 9))
         self.log.pack(fill="x", pady=(6, 0))
+
+        # 结果与参数绑定：扫描时记下当时那组参数，之后一旦改动就让「移除」失效，
+        # 避免"扫的是 A 目录、校验却用新填的 B 目录"这种错配。
+        self.scanned = None
+        self._stats_text = ""
+        for var in (self.var_dir, self.var_extra, self.var_min, self.var_hidden, self.var_only):
+            var.trace_add("write", self._on_param_change)
 
     def _pick_base(self):
         d = self.app.fd.askdirectory()
@@ -634,6 +663,67 @@ class CheckerPage:
         self.btn_start.config(state="normal" if flag else "disabled")
         if not flag:
             self.btn_remove.config(state="disabled")
+
+    def _load_cfg(self):
+        cfg = self.app.cfg
+        self.var_dir.set(str(config.get_value(cfg, "checker.base", "")))
+        self.var_extra.set(str(config.get_value(cfg, "checker.extra", "")))
+        self.var_out.set(str(config.get_value(cfg, "checker.out", "")))
+        try:
+            self.var_min.set(int(config.get_value(cfg, "checker.min_kb", 1)))
+        except (TypeError, ValueError):
+            pass
+        self.var_hidden.set(bool(config.get_value(cfg, "checker.hidden", False)))
+        self.var_only.set(bool(config.get_value(cfg, "checker.only_extra", True)))
+
+    def save_cfg(self):
+        cfg = self.app.cfg
+        config.set_value(cfg, "checker.base", self.var_dir.get().strip())
+        config.set_value(cfg, "checker.extra", self.var_extra.get().strip())
+        config.set_value(cfg, "checker.out", self.var_out.get().strip())
+        try:
+            config.set_value(cfg, "checker.min_kb", int(self.var_min.get()))
+        except (TypeError, ValueError):
+            pass
+        config.set_value(cfg, "checker.hidden", bool(self.var_hidden.get()))
+        config.set_value(cfg, "checker.only_extra", bool(self.var_only.get()))
+
+    def _cur_params(self):
+        """当前界面上这组会影响扫描结果的参数。"""
+        try:
+            min_kb = int(self.var_min.get())
+        except Exception:
+            min_kb = None
+        return {"base": self.var_dir.get().strip(),
+                "extra": self.var_extra.get().strip(),
+                "min": min_kb,
+                "hidden": bool(self.var_hidden.get()),
+                "only": bool(self.var_only.get())}
+
+    @staticmethod
+    def _param_key(p):
+        """比较用：目录统一成绝对小写路径，"最小(KB)"没填好时记成 None。"""
+        def norm(s):
+            s = (s or "").strip()
+            return os.path.normcase(os.path.abspath(s)) if s else ""
+        return (norm(p["base"]), norm(p["extra"]), p["min"], p["hidden"], p["only"])
+
+    def _refresh_remove_btn(self):
+        same = (self.scanned is not None
+                and self._param_key(self._cur_params()) == self._param_key(self.scanned))
+        self.btn_remove.config(state="normal" if (self.groups and same) else "disabled")
+
+    def _on_param_change(self, *_):
+        """参数被改动：结果保留（还能看），但「移除」失效并说明原因。"""
+        if self.scanned is None or self.app.busy:
+            return
+        if self._param_key(self._cur_params()) == self._param_key(self.scanned):
+            self._refresh_remove_btn()
+            self.stats.config(text=self._stats_text)
+        else:
+            self.btn_remove.config(state="disabled")
+            self.stats.config(text="参数已改变，当前结果基于扫描时的设置"
+                                   "（改回原参数或重新扫描后才能移除）")
 
     def _start(self):
         base = self.var_dir.get().strip()
@@ -663,6 +753,8 @@ class CheckerPage:
         self.tree.delete(*self.tree.get_children())
         self.groups = []
         self._reset_sel()
+        self.scanned = None
+        self._stats_text = ""
         self.stats.config(text="")
         self.btn_remove.config(state="disabled")
         self.btn_stop.config(state="normal")
@@ -768,12 +860,13 @@ class CheckerPage:
             self._log("[i] 跳过明细：" + skip_txt)
         if not self.var_out.get().strip():
             self.var_out.set(self._default_out(self.var_dir.get().strip() or "."))
-        self.stats.config(
-            text=f"重复 {len(groups)} 组 / 待移除可回收 {human_size(waste)}"
-                 f"　|　跳过：{skip_txt or '无'}　|　★ 保留　– 不处理　☑ 待移除（单击切换）　双击定位")
-        if groups:
-            self.btn_remove.config(state="normal")
-        else:
+        self._stats_text = (f"重复 {len(groups)} 组 / 待移除可回收 {human_size(waste)}"
+                            f"　|　跳过：{skip_txt or '无'}"
+                            f"　|　★ 保留　– 不处理　☑ 待移除（单击切换）　双击定位")
+        self.stats.config(text=self._stats_text)
+        self.scanned = self._cur_params()      # 记住这组参数，之后改动会让「移除」失效
+        self._refresh_remove_btn()
+        if not groups:
             hint = "未发现基础目录与额外目录重复的文件" if has_extra else "未发现重复文件"
             self.app.set_status(f"{hint}{stopped}")
 
@@ -834,39 +927,39 @@ class CheckerPage:
 
     def _update_stats(self):
         groups = sum(1 for n in self._group_n.values() if n)
-        self.stats.config(
-            text=f"待移除 {self._sel} 个文件 / {groups} 组 / 释放 {human_size(self._sel_size)}"
-                 f"　|　保留件副本占额外 {human_size(self._copy_size)}"
-                 f"　|　★ 保留　– 不处理　☑ 待移除（单击切换）　双击定位")
+        self._stats_text = (
+            f"待移除 {self._sel} 个文件 / {groups} 组 / 释放 {human_size(self._sel_size)}"
+            f"　|　保留件副本占额外 {human_size(self._copy_size)}"
+            f"　|　★ 保留　– 不处理　☑ 待移除（单击切换）　双击定位")
+        self.stats.config(text=self._stats_text)
 
     def _do_remove(self):
         plan = checker_plan(self.groups)
         if not plan:
             self.app.mb.showinfo(APP, "没有勾选任何待移除文件")
             return
-        base = self.var_dir.get().strip()
-        extra = self.var_extra.get().strip()
+        snap = self.scanned
+        if snap is None or self._param_key(self._cur_params()) != self._param_key(snap):
+            self.app.mb.showerror(APP, "参数已改变（目录 / 最小大小 / 隐藏文件 / 比对模式），"
+                                       "请重新扫描后再移除")
+            return
+        base = snap["base"]
+        extra = snap["extra"]
         dst = self.var_out.get().strip()
         if not dst:
             self.app.mb.showwarning(APP, "请先指定待移除目录")
             return
         dst = os.path.abspath(dst)
-        for p in [base] + ([extra] if extra else []):
-            if _overlap(dst, p):
-                self.app.mb.showerror(APP, "待移除目录不能位于基础目录或额外目录内部")
-                return
-        if os.path.isdir(dst) and os.listdir(dst):
-            self.app.mb.showerror(APP, f"待移除目录非空，为避免混入旧数据已中止：\n{dst}")
-            return
         try:
-            os.makedirs(dst, exist_ok=True)
-            need, copy_size = checker_space(plan)
-            free = shutil.disk_usage(dst).free
+            os.makedirs(_long(dst), exist_ok=True)
         except OSError as e:
-            self.app.mb.showerror(APP, f"目标目录不可用：{e}")
+            self.app.mb.showerror(APP, f"待移除目录不可用：{e}")
             return
-        if free < need:
-            self.app.mb.showerror(APP, f"目标盘空间不足。\n需要 {human_size(need)}，可用 {human_size(free)}")
+        need, copy_size = checker_space(plan)
+        problems = preflight(dst, [("基础目录", base), ("额外目录", extra)],
+                             dst_label="待移除目录", must_be_empty=True, need_bytes=need)
+        if problems:
+            self.app.mb.showerror(APP, "以下问题会阻止执行：\n\n· " + "\n· ".join(problems))
             return
         n = sum(len(p["moves"]) for p in plan)
         msg = (f"即将执行移动（不是删除）：\n\n"
@@ -878,7 +971,7 @@ class CheckerPage:
             return
         if not self.app.acquire(self):
             return
-        only_extra = bool(self.var_only.get()) and bool(extra)
+        only_extra = bool(snap["only"]) and bool(extra)
         self._log("[i] 开始移除：%d 个文件 → %s" % (n, dst))
         self.app.stop.clear()
         self.btn_remove.config(state="disabled")
@@ -902,6 +995,7 @@ class CheckerPage:
         self.app.release()
         self.tree.delete(*self.tree.get_children())
         self.groups = []
+        self.scanned = None
         self._reset_sel()
         skip_txt = f"，未尝试 {r['skipped']}" if r.get("skipped") else ""
         self.app.set_status(f"移除完成：成功 {r['ok']}，失败 {r['fail']}{skip_txt}，"
@@ -934,9 +1028,10 @@ class DedupPage:
     def __init__(self, parent, app):
         self.app = app
         self.ttk, self.tk = app.ttk, app.tk
-        self.cfg = config.load()
+        self.cfg = app.cfg                 # 与 App 共用同一份配置字典
         self.cancel = threading.Event()
         self._build(parent)
+        self._load_cfg()
 
     def _build(self, parent):
         ttk, tk = self.ttk, self.tk
@@ -988,7 +1083,8 @@ class DedupPage:
 
         btns = ttk.Frame(wrap)
         btns.pack(fill="x", pady=10)
-        self.btn_start = ttk.Button(btns, text="开始整理", command=self._on_start)
+        self.btn_start = ttk.Button(btns, text="开始整理", style="Write.TButton",
+                                    command=self._on_start)
         self.btn_start.pack(side="left")
         self.btn_stop = ttk.Button(btns, text="停止", width=6,
                                    command=self._on_stop, state="disabled")
@@ -1006,6 +1102,31 @@ class DedupPage:
     def set_enabled(self, flag):
         self.btn_start.config(state="normal" if flag else "disabled")
         self.btn_stop.config(state="disabled")
+
+    def _load_cfg(self):
+        cfg = self.cfg
+        self.var_src.set(str(config.get_value(cfg, "dedup.src", "")))
+        self.var_dst.set(str(config.get_value(cfg, "dedup.dst", "")))
+        self.var_quar.set(str(config.get_value(cfg, "dedup.quar", "")))
+        try:
+            self.var_minsize.set(int(config.get_value(cfg, "dedup.min_kb", 0)))
+        except (TypeError, ValueError):
+            pass
+        keep = str(config.get_value(cfg, "dedup.keep", "最早优先"))
+        if keep in ("最早优先", "最新优先"):
+            self.var_keep.set(keep)
+
+    def save_cfg(self):
+        cfg = self.cfg
+        config.set_value(cfg, "dedup.keyword_rule", self.var_rule.get().strip())
+        config.set_value(cfg, "dedup.src", self.var_src.get().strip())
+        config.set_value(cfg, "dedup.dst", self.var_dst.get().strip())
+        config.set_value(cfg, "dedup.quar", self.var_quar.get().strip())
+        try:
+            config.set_value(cfg, "dedup.min_kb", int(self.var_minsize.get()))
+        except (TypeError, ValueError):
+            pass
+        config.set_value(cfg, "dedup.keep", self.var_keep.get())
 
     def _on_rule_change(self, _ev=None):
         text = self.var_rule.get().strip()
@@ -1074,21 +1195,18 @@ class DedupPage:
 
     def _check_paths(self, src, dst, quar):
         """三个路径两两检查：相等或互相包含都拒绝执行。"""
-        problems = []
         if not src or not os.path.isdir(src):
-            problems.append("待整理目录无效或不存在")
+            return ["待整理目录无效或不存在"]
+        problems = []
         for label, p in (("移动到的目录", dst), ("hash 重复文件", quar)):
             if not p:
                 problems.append(f"请填写「{label}」")
         if problems:
             return problems
-        for n1, p1, n2, p2 in (("待整理目录", src, "移动到的目录", dst),
-                               ("待整理目录", src, "hash 重复文件", quar),
-                               ("移动到的目录", dst, "hash 重复文件", quar)):
-            if _norm(p1) == _norm(p2):
-                problems.append(f"「{n1}」与「{n2}」不能是同一个目录")
-            elif _overlap(p1, p2):
-                problems.append(f"「{n1}」与「{n2}」不能互相包含（一个是另一个的子目录）")
+        problems += preflight(dst, [("待整理目录", src), ("hash 重复文件", quar)],
+                              dst_label="移动到的目录")
+        problems += preflight(quar, [("待整理目录", src), ("移动到的目录", dst)],
+                              dst_label="hash 重复文件")
         return problems
 
     def _on_start(self):
@@ -1110,9 +1228,9 @@ class DedupPage:
         if not self.app.acquire(self):
             return
         rule = self.var_rule.get().strip()
-        config.set_value(self.cfg, "dedup.keyword_rule", rule)
+        self.save_cfg()
         if not config.save(self.cfg):
-            self._log("[!] 配置保存失败（程序目录不可写），正则不会被记住")
+            self._log("[!] 配置保存失败（程序目录不可写），本次设置不会被记住")
         self.cancel.clear()
         self.btn_stop.config(state="normal")
         self.app.progress_start("分析中…")
@@ -1208,8 +1326,74 @@ class App:
         self.stop = threading.Event()
         self.busy = False
         self.owner = None
+        self.cfg = config.load()
         self._build()
+        self._load_cfg()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(100, self._poll)
+
+    # ---------------------------------------------------------------- 配置
+
+    def _load_cfg(self):
+        """启动时把上次的选择搬回界面；没有配置文件时全走默认值。"""
+        algo = str(config.get_value(self.cfg, "app.algo", DEFAULT_ALGO))
+        if algo in ALGOS:
+            self.var_algo.set(algo)
+        try:
+            workers = int(config.get_value(self.cfg, "app.workers", 4))
+        except (TypeError, ValueError):
+            workers = 4
+        self.var_workers.set(min(32, max(1, workers)))
+        self.var_ffprobe.set(str(config.get_value(self.cfg, "app.ffprobe_path", "")))
+        self._apply_ffprobe()
+        geo = str(config.get_value(self.cfg, "app.geometry", "") or "")
+        if geo and "x" in geo:
+            try:
+                self.root.geometry(geo)
+            except self.tk.TclError:
+                pass
+        try:
+            tab = int(config.get_value(self.cfg, "app.last_tab", 0))
+        except (TypeError, ValueError):
+            tab = 0
+        if 0 <= tab < len(self.nb.tabs()):
+            self.nb.select(tab)
+
+    def _save_cfg(self):
+        config.set_value(self.cfg, "app.algo", self.var_algo.get())
+        try:
+            config.set_value(self.cfg, "app.workers", int(self.var_workers.get()))
+        except (TypeError, ValueError, self.tk.TclError):
+            pass
+        config.set_value(self.cfg, "app.geometry", self.root.geometry())
+        config.set_value(self.cfg, "app.last_tab", self.nb.index(self.nb.select()))
+        config.set_value(self.cfg, "app.ffprobe_path", self.var_ffprobe.get().strip())
+        self.chk.save_cfg()
+        self.ded.save_cfg()
+        config.save(self.cfg)
+
+    def _on_close(self):
+        try:
+            self._save_cfg()
+        finally:
+            self.root.destroy()
+
+    def _pick_ffprobe(self):
+        path = self.fd.askopenfilename(title="选择 ffprobe.exe",
+                                       filetypes=[("可执行文件", "*.exe"), ("所有文件", "*.*")])
+        if path:
+            self.var_ffprobe.set(os.path.normpath(path))
+            self._apply_ffprobe()
+            self.set_status("ffprobe：已指定 %s" % path)
+
+    def _clear_ffprobe(self):
+        self.var_ffprobe.set("")
+        self._apply_ffprobe()
+        self.set_status("ffprobe：恢复自动查找（exe 同级或 tools 子目录）")
+
+    def _apply_ffprobe(self, _ev=None):
+        """把界面上的路径交给 photo_media；空或不存在时它自己会退回自动查找。"""
+        photo_media.set_tool_path("ffprobe", self.var_ffprobe.get())
 
     def _build(self):
         ttk, tk = self.ttk, self.tk
@@ -1226,6 +1410,23 @@ class App:
         ttk.Label(bar, text="线程").pack(side="left", padx=(16, 0))
         self.var_workers = tk.IntVar(value=4)
         ttk.Spinbox(bar, from_=1, to=32, width=5, textvariable=self.var_workers).pack(side="left", padx=6)
+
+        # ffprobe 可选指定（不指定就在 exe 同级 / tools 子目录里找；都没有就退回内置解析）
+        ttk.Label(bar, text="ffprobe").pack(side="left", padx=(16, 0))
+        self.var_ffprobe = tk.StringVar()
+        entry = ttk.Entry(bar, textvariable=self.var_ffprobe, width=26)
+        entry.pack(side="left", padx=6)
+        entry.bind("<FocusOut>", self._apply_ffprobe)
+        entry.bind("<Return>", self._apply_ffprobe)
+        ttk.Button(bar, text="选择…", width=7,
+                   command=self._pick_ffprobe).pack(side="left")
+        ttk.Button(bar, text="清空", width=6,
+                   command=self._clear_ffprobe).pack(side="left", padx=(4, 0))
+
+        # 会真动文件的按钮统一样式（加粗 + 深红），与"只读"按钮区分开
+        style = ttk.Style()
+        style.configure("Write.TButton", font=("Microsoft YaHei UI", 9, "bold"),
+                        foreground="#A32D2D")
 
         # 底部状态区先从底部占位，窗口再小也不会被页签内容挤出可视区
         bottom = ttk.Frame(outer)

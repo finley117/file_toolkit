@@ -1,6 +1,6 @@
 """命名逻辑：模板校验、渲染、冲突消解、计划生成、执行。
 
-这一层不引用 tkinter，可被 UI 与命令行复用，也便于用 --selftest 验证。
+这一层不引用 tkinter，可被 UI 复用，也便于用 run_tests.py 验证。
 """
 
 import csv
@@ -8,6 +8,7 @@ import os
 import re
 
 import photo_media
+from fsops import transfer
 
 TEMPLATE_VARS = [
     ("{type}", "文件类型（IMG 照片 / VID 视频）"),
@@ -406,7 +407,9 @@ def apply_plan(rows, report_dir, on_progress=None, on_log=None, cancel=None):
                     raise RuntimeError("文件已变化（大小不符）")
                 if os.path.exists(dst) and os.path.normcase(src) != os.path.normcase(dst):
                     raise FileExistsError("目标已存在")
-                os.rename(src, dst)
+                moved, why = transfer(src, dst)
+                if not moved:
+                    raise RuntimeError(why)
                 rec["结果"] = "成功"
                 done += 1
             except Exception as e:

@@ -93,8 +93,23 @@ def _base_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
+# 用户在界面上手动指定的外部程序路径（键为不带 .exe 的名字，如 "ffprobe"）
+_TOOL_OVERRIDE = {}
+
+
+def set_tool_path(name, path):
+    """指定外部程序路径；传空字符串表示恢复自动查找。
+
+    这是给"不想编译/不想放进 tools 目录"的人留的口子：界面上选一次，存进 config.json。
+    """
+    _TOOL_OVERRIDE[name.replace(".exe", "").lower()] = (path or "").strip()
+
+
 def _find_tool(name):
-    """在 exe 同级与 tools 子目录查找可执行文件。"""
+    """先看用户指定路径，再在 exe 同级与 tools 子目录查找。"""
+    want = _TOOL_OVERRIDE.get(name.replace(".exe", "").lower())
+    if want and os.path.isfile(want):
+        return want
     base = _base_dir()
     for cand in (
         os.path.join(base, name),
@@ -623,7 +638,8 @@ def read_many(paths, workers=None, on_progress=None, cancel=None):
     workers = max(1, workers or DEFAULT_WORKERS)
     results = {}
     done = 0
-    with ThreadPoolExecutor(max_workers=workers) as ex:
+    ex = ThreadPoolExecutor(max_workers=workers)
+    try:
         futures = {ex.submit(read_meta, p): p for p in paths}
         for fut in as_completed(futures):
             if cancel is not None and cancel.is_set():
@@ -636,6 +652,10 @@ def read_many(paths, workers=None, on_progress=None, cancel=None):
             done += 1
             if on_progress is not None:
                 on_progress(done, total)
+    finally:
+        # 取消时丢弃还没开跑的任务，只等手上这几个跑完（最多 workers 个），
+        # 而不是把整批都跑完——那是"点了停止却还在忙十几分钟"的原因。
+        ex.shutdown(wait=False, cancel_futures=True)
     return results
 
 
