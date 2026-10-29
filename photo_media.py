@@ -32,6 +32,7 @@ ALTERNATE_KEEP = "保留原文件名"
 ALTERNATE_DATES = [DATE_BASIS_MTIME, DATE_BASIS_CTIME, ALTERNATE_KEEP]
 
 _VIDEO_BACKEND = None  # None=未探测；"ffprobe"/"ffmpeg"/"py"
+_VIDEO_LOCK = Lock()
 
 # MP4 纪元：1904-01-01 00:00:00 UTC 与 Unix 纪元之差
 _MP4_EPOCH_OFFSET = 2082844800
@@ -398,29 +399,23 @@ def _meta_from_heic(path):
 # ------------------------------------------------------------------ 视频
 
 def detect_video_backend():
-    """探测视频元数据后端：ffprobe → ffmpeg → 纯 Python。结果缓存。"""
+    """探测视频元数据后端：ffprobe → ffmpeg → 纯 Python。结果缓存，多线程安全。"""
     global _VIDEO_BACKEND
     if _VIDEO_BACKEND is not None:
         return _VIDEO_BACKEND
-    for name, kind in (("ffprobe.exe", "ffprobe"), ("ffmpeg.exe", "ffmpeg")):
-        exe = _find_tool(name)
-        if not exe:
-            continue
-        probe = os.path.join(_base_dir(), "_probe.bin")
-        try:
-            with open(probe, "wb") as f:
-                f.write(b"\x00" * 16)
+    with _VIDEO_LOCK:
+        if _VIDEO_BACKEND is not None:
+            return _VIDEO_BACKEND
+        for name, kind in (("ffprobe.exe", "ffprobe"), ("ffmpeg.exe", "ffmpeg")):
+            exe = _find_tool(name)
+            if not exe:
+                continue
             rc, _out, _err = _run_hidden([exe, "-version"], timeout=8)
             if rc == 0:
                 _VIDEO_BACKEND = kind
                 return _VIDEO_BACKEND
-        finally:
-            try:
-                os.unlink(probe)
-            except OSError:
-                pass
-    _VIDEO_BACKEND = "py"
-    return _VIDEO_BACKEND
+        _VIDEO_BACKEND = "py"
+        return _VIDEO_BACKEND
 
 
 def _meta_from_ffprobe(path, exe):
@@ -470,7 +465,7 @@ def _parse_iso_time(text):
             continue
         if text.endswith("Z") or "+00:00" in text:
             try:
-                return datetime.datetime.utcfromtimestamp(
+                return datetime.datetime.fromtimestamp(
                     base.replace(tzinfo=datetime.timezone.utc).timestamp())
             except (OSError, ValueError):
                 return base

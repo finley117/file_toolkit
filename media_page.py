@@ -18,7 +18,7 @@ class MediaPage:
         self.app = app
         self.root = app.root
         self.frame = ttk.Frame(parent)
-        self.cancelled = False
+        self.scan_cancel = None
         self.scan_thread = None
         self.dups = []
         self.current_rows = []
@@ -167,27 +167,29 @@ class MediaPage:
         if not self.app.acquire(self):
             return False
         kinds = {k for k, v in self.var_kinds.items() if v.get()} or {'video'}
-        self.cancelled = False
+        cancel = threading.Event()
+        self.scan_cancel = cancel
         self.btn_stop.config(state='normal')
         self.progress.pack(side='right')
         self.progress.start()
-        t = threading.Thread(target=self._scan_worker, args=(root, custom, kinds), daemon=True)
+        t = threading.Thread(target=self._scan_worker, args=(root, custom, kinds, cancel),
+                             daemon=True)
         t.start()
         self.scan_thread = t
         return True
 
     def stop_scan(self):
-        if self.scan_thread and self.scan_thread.is_alive():
-            self.cancelled = True
+        if self.scan_cancel is not None and not self.scan_cancel.is_set():
+            self.scan_cancel.set()
             self.btn_stop.config(state='disabled')
             self.status.config(text='正在停止扫描…')
 
-    def _scan_worker(self, root, custom, kinds):
+    def _scan_worker(self, root, custom, kinds, cancel):
         c = None
         try:
             files, _ = scanner.scan(root, kinds, progress_cb=self._prog,
-                                    cancel_cb=lambda: self.cancelled)
-            if self.cancelled:
+                                    cancel_cb=cancel.is_set)
+            if cancel.is_set():
                 self.root.after(0, self._finish_scan, root, 0, True)
                 return
             c = db.conn()
@@ -316,8 +318,13 @@ class MediaPage:
         c = db.conn()
         try:
             if mode == 'path':
-                rows = db.list_path_keywords(c, pid)
-                title = '路径关键字: %s' % label
+                if db.path_exists(c, pid):
+                    rows = db.list_path_keywords(c, pid)
+                    title = '路径关键字: %s' % label
+                else:
+                    self.view = None
+                    rows, title = [], '查重结果 (单击关键字展开, 双击/右键打开所在文件夹)'
+                    self.log_msg('该路径已从索引中删除, 视图已清空')
             else:
                 rows = db.find_duplicates(c)
                 title = '查重结果 (单击关键字展开, 双击/右键打开所在文件夹)'

@@ -4,7 +4,6 @@ Tab1 查重清理 —— 递归/双目录查重，重复件移动到待移除目
 Tab2 关键字整理 —— 单层目录，按关键字与重复情况整理到目标目录（两阶段计划表）。
 """
 
-import csv
 import hashlib
 import os
 import queue
@@ -20,11 +19,12 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
+import config
 from media_page import MediaPage
 from photo_page import PhotoPage
 
 APP = "File Toolkit"
-VER = "20261028b"  # 版本号＝交付日期（同日多次交付加 a/b），每次交付改这一行
+VER = "20261029"  # 版本号＝交付日期（同日多次交付加 a/b），每次交付改这一行
 _CHUNK = 4 << 20
 _BENCH_MB = 32
 _ATTR_HIDDEN = 0x2
@@ -89,13 +89,9 @@ def _overlap(a, b):
     return common in (_norm(a), _norm(b))
 
 
-def _under(path, root):
-    try:
-        a = os.path.normcase(os.path.abspath(path))
-        b = os.path.normcase(os.path.abspath(root))
-        return os.path.commonpath([a, b]) == b
-    except ValueError:
-        return False
+def _is_drive_root(path):
+    p = os.path.abspath(path).rstrip("\\/")
+    return len(p) <= 2 or p.endswith(":")
 
 
 def _unique_path(folder, name):
@@ -212,26 +208,31 @@ def scan_tree(root, min_bytes, include_hidden, stop, src, on_progress):
 
 def hash_items(items, workers, stop, algo, on_progress):
     if not items:
-        return
+        return 0
     total = len(items)
-    state = {"done": 0}
+    state = {"done": 0, "fail": 0}
     lock = threading.Lock()
 
     def one(it):
         if stop.is_set():
             return
+        bad = False
         try:
             it["hash"] = digest_file(it["path"], algo, stop)
         except OSError:
             it["hash"] = None
+            bad = True
         with lock:
             state["done"] += 1
+            if bad:
+                state["fail"] += 1
             n = state["done"]
         if n % 20 == 0 or n == total:
             on_progress(n, total)
 
     with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
         list(ex.map(one, items))
+    return state["fail"]
 
 
 def group_by_hash(items):
@@ -249,11 +250,13 @@ def checker_rank(item):
             item["depth"], item["mtime"], item["path"].lower())
 
 
-def checker_groups(rows, workers, stop, algo, only_extra, on_hash):
+def checker_groups(rows, workers, stop, algo, only_extra, on_hash, stat=None):
     cands = group_by_hash(rows)
     flat = [r for g in cands for r in g]
     on_hash(0, len(flat))
-    hash_items(flat, workers, stop, algo, on_hash)
+    fail = hash_items(flat, workers, stop, algo, on_hash)
+    if stat is not None and fail:
+        stat["哈希失败"] = fail
 
     by_hash = defaultdict(list)
     for r in flat:
@@ -301,11 +304,11 @@ def checker_space(plan):
 
 
 def checker_execute(plan, dst, stop, on_progress, algo, only_extra):
-    os.makedirs(dst, exist_ok=True)
+    os.makedirs(_long(dst), exist_ok=True)
     mode_txt = "仅比对额外目录" if only_extra else "全量去重"
     manifest = [f"{APP} v{VER}  移除清单  {datetime.now():%Y-%m-%d %H:%M:%S}",
                 f"算法 {algo}   模式 {mode_txt}", f"目标目录 {dst}", ""]
-    ok = fail = copied = done = 0
+    ok = fail = copied = skipped = done = 0
     total = sum(len(p["moves"]) for p in plan)
     for gi, item in enumerate(plan, 1):
         if stop.is_set():
@@ -313,10 +316,10 @@ def checker_execute(plan, dst, stop, on_progress, algo, only_extra):
         g, kept, moves = item["group"], item["kept"], item["moves"]
         folder = os.path.join(dst, g["hash"][:16])
         try:
-            os.makedirs(folder, exist_ok=True)
+            os.makedirs(_long(folder), exist_ok=True)
         except OSError as e:
-            manifest.append(f"[组{gi}] 创建目录失败 {folder}: {e}")
-            fail += len(moves)
+            manifest.append(f"[组{gi}] 创建目录失败，本组 {len(moves)} 个文件未尝试：{folder}: {e}")
+            skipped += len(moves)
             continue
         manifest.append(f"[组{gi}] 哈希 {g['hash']}  大小 {human_size(g['size'])}  份数 {len(g['members'])}")
         manifest.append(f"  保留: [{'基础' if kept['src'] == SRC_BASE else '额外'}] {kept['path']}")
@@ -342,12 +345,14 @@ def checker_execute(plan, dst, stop, on_progress, algo, only_extra):
             done += 1
             on_progress(done, total)
         manifest.append("")
-    summary = {"ok": ok, "fail": fail, "copied": copied,
+    if not stop.is_set():
+        on_progress(total, total)
+    summary = {"ok": ok, "fail": fail, "skipped": skipped, "copied": copied,
                "groups": len(plan), "total": total, "stopped": stop.is_set()}
-    manifest.append(f"结果：移动成功 {ok}，失败 {fail}，副本 {copied}"
+    manifest.append(f"结果：移动成功 {ok}，失败 {fail}，未尝试 {skipped}，副本 {copied}"
                     + ("（已中断）" if stop.is_set() else ""))
     try:
-        with open(os.path.join(dst, "清单.txt"), "w", encoding="utf-8") as f:
+        with open(_long(os.path.join(dst, "清单.txt")), "w", encoding="utf-8") as f:
             f.write("\n".join(manifest) + "\n")
     except OSError:
         pass
@@ -361,13 +366,25 @@ _DIGIT = re.compile(r"(?<![0-9])([0-9]{3,6})(?![0-9])")
 _NUM_MARK = re.compile(r"[\(（]\s*(\d{1,2})\s*[\)）]")
 _CP_MARK = re.compile(r"(?i)(?<![A-Za-z])(copy|副本)(?![A-Za-z])")
 
-PLAN_FIELDS = ["组号", "名次", "动作", "文件名", "关键字", "副本标记", "大小(B)",
-               "修改时间", "哈希", "源路径", "目标路径", "备注"]
-MANIFEST_FIELDS = ["时间", "动作", "原路径", "新路径", "关键字", "副本标记",
-                   "大小(B)", "哈希", "组号", "备注"]
+_KEYWORD_HINT = "留空＝默认规则（3~6 位字母 + 其后 3~6 位数字，拼接后转小写）"
 
 
-def extract_keyword(stem):
+def compile_keyword_rule(text):
+    """把用户输入编译成正则；空串返回 None（表示用内置默认规则）。"""
+    text = (text or "").strip()
+    if not text:
+        return None
+    return re.compile(text, re.IGNORECASE)
+
+
+def extract_keyword(stem, prog=None):
+    """取关键字：prog 为空走内置规则，否则取用户正则的第一个匹配。"""
+    if prog is not None:
+        m = prog.search(stem)
+        if not m:
+            return ""
+        parts = m.groups() or (m.group(0),)
+        return "".join(p for p in parts if p).lower()
     for d in _DIGIT.finditer(stem):
         letters = None
         for m in _LETTER.finditer(stem[:d.start()]):
@@ -393,18 +410,19 @@ def dedup_rank(item, keep):
 
 
 def dedup_analyze(src, dst, quarantine, workers, min_bytes, keep, algo,
-                  on_log=print, on_progress=None):
+                  rule="", on_log=print, on_progress=None, cancel=None):
     src = os.path.abspath(src)
-    stop = threading.Event()
+    stop = cancel or threading.Event()
     rows, skipped = scan_flat(src, min_bytes, False, stop)
     on_log(f"[i] 扫描 {src}")
     on_log(f"[i] 纳入 {len(rows)} 个文件，跳过 {sum(skipped.values())} 个 {skipped or ''}")
     if not rows:
         raise RuntimeError("源目录没有可处理的文件")
+    prog = compile_keyword_rule(rule)
     for r in rows:
         r["name"] = os.path.basename(r["path"])
         r["stem"] = Path(r["name"]).stem
-        r["kw"] = extract_keyword(r["stem"])
+        r["kw"] = extract_keyword(r["stem"], prog)
         r["mark"], r["mark_num"] = copy_mark(r["stem"])
 
     cands = group_by_hash(rows)
@@ -436,135 +454,67 @@ def dedup_analyze(src, dst, quarantine, workers, min_bytes, keep, algo,
 
     plan_rows = []
     for it in rows:
-        gid, rank, total = in_group.get(it["path"], ("", "", ""))
-        note = []
-        if gid:
-            note.append("重复组保留件" if rank == 1 else f"重复组第{rank}份/共{total}份")
-        if it["kw"]:
-            note.append(f"关键字={it['kw']}")
+        gid, rank = in_group.get(it["path"], ("", ""))[:2]
         if gid and rank > 1:
-            act, target = "隔离", os.path.join(quarantine, it["name"])
-        elif gid and rank == 1:
-            act, target = "移动", os.path.join(dst, it["name"])
-        elif it["kw"]:
-            act, target = "移动", os.path.join(dst, it["name"])
+            act = "隔离"
+        elif it["kw"] or gid:
+            act = "移动"
         else:
-            act, target = "不动", ""
-        plan_rows.append({
-            "组号": gid, "名次": rank, "动作": act, "文件名": it["name"],
-            "关键字": it["kw"], "副本标记": "是" if it["mark"] else "",
-            "大小(B)": it["size"],
-            "修改时间": datetime.fromtimestamp(it["mtime"]).strftime("%Y-%m-%d %H:%M:%S"),
-            "哈希": it.get("hash", ""), "源路径": it["path"],
-            "目标路径": target, "备注": "；".join(note),
-        })
-
-    kw_stat = defaultdict(int)
-    for it in rows:
-        if it["kw"]:
-            kw_stat[it["kw"]] += 1
-
-    report_dir = os.path.abspath(src + "_dedup_report")
-    os.makedirs(report_dir, exist_ok=True)
-    plan_path = os.path.join(report_dir, "plan.csv")
-    with open(plan_path, "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.DictWriter(f, fieldnames=PLAN_FIELDS)
-        w.writeheader()
-        w.writerows(plan_rows)
+            act = "不动"
+        plan_rows.append({"动作": act, "文件名": it["name"], "源路径": it["path"],
+                          "关键字": it["kw"]})
 
     cnt = defaultdict(int)
     for r in plan_rows:
         cnt[r["动作"]] += 1
-    waste = sum(g["members"][0]["size"] * (len(g["members"]) - 1) for g in groups)
-    summary = [
-        f"源目录      : {src}",
-        f"目标目录    : {dst}",
-        f"隔离区      : {quarantine}",
-        f"哈希算法    : {algo}",
-        f"文件总数    : {len(rows)}（跳过 {sum(skipped.values())}）",
-        f"总容量      : {sum(i['size'] for i in rows) / 1048576:.1f} MB",
-        f"重复组      : {len(groups)} 组，副本 {cnt['隔离']} 个，可回收 {waste / 1048576:.1f} MB",
-        f"关键字命中  : {sum(1 for i in rows if i['kw'])} 个文件，{len(kw_stat)} 个不同关键字",
-        f"待移动      : {cnt['移动']} 个（保留件 + 命中件）",
-        f"不动        : {cnt['不动']} 个",
-        "",
-        "关键字 TOP 10：",
-    ]
-    for k, v in sorted(kw_stat.items(), key=lambda kv: (-kv[1], kv[0]))[:10]:
-        summary.append(f"  {k:<24} {v:>6} 个文件")
-    text = "\n".join(summary)
-    with open(os.path.join(report_dir, "summary.txt"), "w", encoding="utf-8") as f:
-        f.write(text + "\n")
-    for line in summary:
-        on_log(line)
-    on_log(f"[OK] 计划已生成：{plan_path}")
-    return {"report_dir": report_dir, "plan": plan_path, "rows": plan_rows,
-            "counts": dict(cnt), "groups": len(groups), "items": len(rows),
-            "dst": dst, "quar": quarantine}
+    kw_hit = sum(1 for i in rows if i["kw"])
+    on_log(f"[i] 重复组 {len(groups)} 组；关键字命中 {kw_hit} 个，将移动 {cnt['移动']} 个；"
+           f"内容重复 {cnt['隔离']} 个；不动 {cnt['不动']} 个")
+    if stop.is_set():
+        on_log("[i] 已停止，结果不完整")
+    return {"rows": plan_rows, "counts": dict(cnt), "groups": len(groups),
+            "items": len(rows), "dst": dst, "quar": quarantine,
+            "skipped": dict(skipped), "stopped": stop.is_set()}
 
 
-def dedup_apply(plan_path, dst, quarantine, on_log=print, rebase=None):
-    with open(plan_path, "r", newline="", encoding="utf-8-sig") as f:
-        rows = list(csv.DictReader(f))
-    if not rows:
-        raise RuntimeError("计划表为空")
+def dedup_execute(rows, dst, quarantine, on_log=print, on_progress=None, cancel=None):
+    """按内存里的计划移动文件：只移动，不删除、不改名；目标有同名则跳过。"""
     dst, quarantine = os.path.abspath(dst), os.path.abspath(quarantine)
-    old_dst, old_quar = rebase if rebase else (None, None)
+    todo = [r for r in rows if r["动作"] in ("隔离", "移动")]
+    total = len(todo)
+    on_log(f"[i] 待移动 {total} 个文件（命中关键字 + 内容重复）")
+    if not total:
+        return {"moved": 0, "skipped": 0, "failed": 0, "stopped": False, "errors": []}
     for d in (dst, quarantine):
-        if os.path.isdir(d) and os.listdir(d):
-            raise RuntimeError(f"目标目录非空，为避免覆盖已中止：{d}")
-        os.makedirs(d, exist_ok=True)
-
-    todo = [r for r in rows if r["动作"].strip() in ("隔离", "移动")]
-    on_log(f"[i] 待执行 {len(todo)} 个文件（隔离 + 移动）")
-    manifest_path = os.path.join(os.path.dirname(plan_path), "manifest.csv")
-    failed, done = [], 0
-    with open(manifest_path, "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.DictWriter(f, fieldnames=MANIFEST_FIELDS)
-        w.writeheader()
-        for r in todo:
-            src_path = r["源路径"]
-            act = r["动作"].strip()
-            plan_target = (r.get("目标路径") or "").strip()
-            base_dir = quarantine if act == "隔离" else dst
-            if plan_target and old_dst and _under(plan_target, old_dst):
-                plan_target = os.path.join(dst, os.path.relpath(plan_target, old_dst))
-            elif plan_target and old_quar and _under(plan_target, old_quar):
-                plan_target = os.path.join(quarantine, os.path.relpath(plan_target, old_quar))
-            if plan_target:
-                target = plan_target if os.path.isabs(plan_target) else os.path.join(base_dir, plan_target)
-            else:
-                target = os.path.join(base_dir, os.path.basename(src_path))
-            rec = {
-                "时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "动作": act,
-                "原路径": src_path, "新路径": target, "关键字": r.get("关键字", ""),
-                "副本标记": r.get("副本标记", ""), "大小(B)": r.get("大小(B)", ""),
-                "哈希": r.get("哈希", ""), "组号": r.get("组号", ""), "备注": r.get("备注", ""),
-            }
-            try:
-                if not os.path.isfile(_long(src_path)):
-                    raise FileNotFoundError("源文件已不存在")
-                os.makedirs(_long(os.path.dirname(target)), exist_ok=True)
-                if os.path.exists(_long(target)):
-                    raise FileExistsError("目标位置已存在同名文件")
-                shutil.move(_long(src_path), _long(target))
-                done += 1
-                rec["备注"] = (rec["备注"] + "；" if rec["备注"] else "") + "成功"
-            except Exception as e:
-                rec["备注"] = (rec["备注"] + "；" if rec["备注"] else "") + f"失败：{e}"
-                failed.append({"源路径": src_path, "错误": str(e)})
-            w.writerow(rec)
-            if done and done % 100 == 0:
-                on_log(f"[i] 已处理 {done}/{len(todo)}")
-    if failed:
-        fp = os.path.join(os.path.dirname(plan_path), "failed.csv")
-        with open(fp, "w", newline="", encoding="utf-8-sig") as f:
-            w = csv.DictWriter(f, fieldnames=["源路径", "错误"])
-            w.writeheader()
-            w.writerows(failed)
-        on_log(f"[!] 失败 {len(failed)} 个，明细：{fp}")
-    on_log(f"[OK] 执行完成：成功 {done} 个，失败 {len(failed)} 个")
-    return {"moved": done, "failed": failed, "manifest": manifest_path}
+        os.makedirs(_long(d), exist_ok=True)
+    moved = skipped = failed = 0
+    errors = []
+    for i, r in enumerate(todo, 1):
+        if cancel is not None and cancel.is_set():
+            break
+        base = quarantine if r["动作"] == "隔离" else dst
+        src_path = r["源路径"]
+        target = os.path.join(base, r["文件名"])
+        try:
+            if not os.path.isfile(_long(src_path)):
+                raise FileNotFoundError("源文件已不存在")
+            if os.path.exists(_long(target)):
+                skipped += 1
+                on_log(f"[i] 跳过（目标已有同名）：{r['文件名']}")
+                continue
+            shutil.move(_long(src_path), _long(target))
+            moved += 1
+        except Exception as e:
+            failed += 1
+            errors.append({"源路径": src_path, "错误": str(e)})
+            on_log(f"[!] 失败 {r['文件名']}：{e}")
+        if on_progress and (i % 50 == 0 or i == total):
+            on_progress(i, total)
+    stopped = bool(cancel is not None and cancel.is_set())
+    on_log(f"[OK] 移动完成：成功 {moved}，跳过 {skipped}，失败 {failed}"
+           + ("（已中断）" if stopped else ""))
+    return {"moved": moved, "skipped": skipped, "failed": failed,
+            "stopped": stopped, "errors": errors}
 
 
 def benchmark_algo(algo):
@@ -587,6 +537,7 @@ class CheckerPage:
         self.groups = []
         self.n_base = self.n_extra = 0
         self.started = 0.0
+        self._reset_sel()
         self._build(parent)
 
     def _build(self, parent):
@@ -690,6 +641,9 @@ class CheckerPage:
         if not base or not os.path.isdir(base):
             self.app.mb.showerror(APP, "请先选择有效的基础目录")
             return
+        if _is_drive_root(base):
+            self.app.mb.showerror(APP, "暂不支持以盘根作为基础目录，请选择盘内的具体目录（整盘扫描请分段进行）")
+            return
         if extra:
             if not os.path.isdir(extra):
                 self.app.mb.showerror(APP, "额外目录无效")
@@ -708,6 +662,7 @@ class CheckerPage:
         self.app.stop.clear()
         self.tree.delete(*self.tree.get_children())
         self.groups = []
+        self._reset_sel()
         self.stats.config(text="")
         self.btn_remove.config(state="disabled")
         self.btn_stop.config(state="normal")
@@ -739,8 +694,11 @@ class CheckerPage:
                 if stop.is_set():
                     groups = []
                 else:
+                    stat = {}
                     groups = checker_groups(rows, workers, stop, algo, only_extra,
-                                            lambda d, t: post(self.tag, "hash", (d, t)))
+                                            lambda d, t: post(self.tag, "hash", (d, t)),
+                                            stat=stat)
+                    skipped.update(stat)
                 post(self.tag, "done", (groups, skipped, only_extra, bool(extra)))
             except Exception:
                 post(self.tag, "error", traceback.format_exc())
@@ -780,6 +738,7 @@ class CheckerPage:
     def _render(self, groups, skipped, only_extra, has_extra):
         self.app.release()
         self.groups = groups
+        self._reset_sel()
         for gi, g in enumerate(groups):
             tag = "even" if gi % 2 == 0 else "odd"
             for i, m in enumerate(g["members"]):
@@ -795,8 +754,7 @@ class CheckerPage:
                     human_size(g["size"]) if i == 0 else "",
                     g["hash"] if i == 0 else "", m["path"],
                 ), tags=(tag,))
-        waste = sum(m["size"] for g in groups for m in g["members"]
-                    if m["checked"] and m["deletable"])
+        waste = self._sel_size
         used = time.time() - self.started
         skip_txt = "，".join(f"{k} {v}" for k, v in sorted(skipped.items()))
         stopped = "（已停止，结果不完整）" if self.app.stop.is_set() else ""
@@ -821,24 +779,43 @@ class CheckerPage:
 
     def _default_out(self, base):
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        b = os.path.abspath(base).rstrip("\\/")
-        if len(b) <= 2 or b.endswith(":"):
-            return os.path.join(b, f"待移除_{stamp}")
-        return f"{b}_待移除_{stamp}"
+        return "%s_待移除_%s" % (os.path.abspath(base).rstrip("\\/"), stamp)
 
-    def _iter_members(self):
-        for g in self.groups:
+    def _reset_sel(self):
+        """结果变化后重建勾选索引与计数；勾选过程中只做增量加减。"""
+        self._by_path = {}
+        self._group_n = {}
+        self._sel = self._sel_size = self._copy_size = 0
+        for gi, g in enumerate(self.groups):
             for m in g["members"]:
-                yield m
+                self._by_path[m["path"]] = (gi, m)
+                if m["checked"] and m["deletable"]:
+                    self._group_n[gi] = self._group_n.get(gi, 0) + 1
+                    self._sel += 1
+                    self._sel_size += m["size"]
+            if self._group_n.get(gi):
+                self._copy_size += g["keeper"]["size"]
+
+    def _set_checked(self, gi, m, flag):
+        if not m["deletable"] or m["checked"] == flag:
+            return
+        m["checked"] = flag
+        delta = 1 if flag else -1
+        n = self._group_n.get(gi, 0)
+        self._group_n[gi] = n + delta
+        self._sel += delta
+        self._sel_size += delta * m["size"]
+        if n == 0 and flag:
+            self._copy_size += self.groups[gi]["keeper"]["size"]
+        elif n == 1 and not flag:
+            self._copy_size -= self.groups[gi]["keeper"]["size"]
+        self.tree.set(m["path"], "sel", "☑" if flag else "☐")
 
     def _set_all(self, flag):
         if not self.groups:
             return
-        for m in self._iter_members():
-            if not m["deletable"]:
-                continue
-            m["checked"] = flag
-            self.tree.set(m["path"], "sel", "☑" if flag else "☐")
+        for gi, m in self._by_path.values():
+            self._set_checked(gi, m, flag)
         self._update_stats()
 
     def _on_click(self, ev):
@@ -848,24 +825,18 @@ class CheckerPage:
             return
         if self.tree.identify_column(ev.x) != "#1":
             return
-        iid = self.tree.identify_row(ev.y)
-        if not iid:
+        hit = self._by_path.get(self.tree.identify_row(ev.y))
+        if not hit:
             return
-        for m in self._iter_members():
-            if m["path"] == iid and m["deletable"]:
-                m["checked"] = not m["checked"]
-                self.tree.set(iid, "sel", "☑" if m["checked"] else "☐")
-                self._update_stats()
-                return
+        gi, m = hit
+        self._set_checked(gi, m, not m["checked"])
+        self._update_stats()
 
     def _update_stats(self):
-        plan = checker_plan(self.groups)
-        n = sum(len(p["moves"]) for p in plan)
-        size = sum(m["size"] for p in plan for m in p["moves"])
-        copy_size = sum(p["kept"]["size"] for p in plan)
+        groups = sum(1 for n in self._group_n.values() if n)
         self.stats.config(
-            text=f"待移除 {n} 个文件 / {len(plan)} 组 / 释放 {human_size(size)}"
-                 f"　|　保留件副本占额外 {human_size(copy_size)}"
+            text=f"待移除 {self._sel} 个文件 / {groups} 组 / 释放 {human_size(self._sel_size)}"
+                 f"　|　保留件副本占额外 {human_size(self._copy_size)}"
                  f"　|　★ 保留　– 不处理　☑ 待移除（单击切换）　双击定位")
 
     def _do_remove(self):
@@ -931,10 +902,14 @@ class CheckerPage:
         self.app.release()
         self.tree.delete(*self.tree.get_children())
         self.groups = []
-        self.app.set_status(f"移除完成：成功 {r['ok']}，失败 {r['fail']}，保留件副本 {r['copied']}"
+        self._reset_sel()
+        skip_txt = f"，未尝试 {r['skipped']}" if r.get("skipped") else ""
+        self.app.set_status(f"移除完成：成功 {r['ok']}，失败 {r['fail']}{skip_txt}，"
+                            f"保留件副本 {r['copied']}"
                             + ("（已中断）" if r["stopped"] else ""))
-        self._log("[OK] 移除完成：成功 %d，失败 %d，保留件副本 %d%s"
-                  % (r["ok"], r["fail"], r["copied"], "（已中断）" if r["stopped"] else ""))
+        self._log("[OK] 移除完成：成功 %d，失败 %d，未尝试 %d，保留件副本 %d%s"
+                  % (r["ok"], r["fail"], r.get("skipped", 0), r["copied"],
+                     "（已中断）" if r["stopped"] else ""))
         self.stats.config(text=f"清单已写入 {os.path.join(self.var_out.get(), '清单.txt')}"
                                f"　|　对比完成后可手动删除整个待移除目录")
         if r["fail"]:
@@ -959,7 +934,8 @@ class DedupPage:
     def __init__(self, parent, app):
         self.app = app
         self.ttk, self.tk = app.ttk, app.tk
-        self.result = None
+        self.cfg = config.load()
+        self.cancel = threading.Event()
         self._build(parent)
 
     def _build(self, parent):
@@ -974,12 +950,28 @@ class DedupPage:
         self.var_src = tk.StringVar()
         self.var_dst = tk.StringVar()
         self.var_quar = tk.StringVar()
-        for i, (label, var) in enumerate((("源目录", self.var_src), ("目标目录", self.var_dst),
-                                          ("隔离区", self.var_quar))):
-            ttk.Label(grid, text=label, width=8).grid(row=i, column=0, sticky="w", pady=3)
+        for i, (label, var) in enumerate((("待整理目录", self.var_src),
+                                          ("移动到的目录", self.var_dst),
+                                          ("hash 重复文件", self.var_quar))):
+            ttk.Label(grid, text=label, width=13).grid(row=i, column=0, sticky="w", pady=3)
             ttk.Entry(grid, textvariable=var).grid(row=i, column=1, sticky="ew", padx=8, pady=3)
             ttk.Button(grid, text="选择…", width=8,
                        command=lambda v=var: self._pick(v)).grid(row=i, column=2, pady=3)
+
+        rule_row = ttk.Frame(wrap)
+        rule_row.pack(fill="x", pady=(8, 0))
+        ttk.Label(rule_row, text="关键字正则", width=13).pack(side="left")
+        self.var_rule = tk.StringVar(
+            value=str(config.get_value(self.cfg, "dedup.keyword_rule", "")))
+        entry = ttk.Entry(rule_row, textvariable=self.var_rule)
+        entry.pack(side="left", fill="x", expand=True, padx=8)
+        entry.bind("<FocusOut>", self._on_rule_change)
+        entry.bind("<Return>", self._on_rule_change)
+        ttk.Button(rule_row, text="恢复默认", width=10,
+                   command=self._reset_rule).pack(side="left")
+
+        self.lbl_rule = ttk.Label(wrap, text="", foreground="#5F5E5A")
+        self.lbl_rule.pack(fill="x", pady=(2, 0))
 
         opts = ttk.Frame(wrap)
         opts.pack(fill="x", pady=(8, 0))
@@ -987,31 +979,51 @@ class DedupPage:
         self.var_minsize = tk.IntVar(value=0)
         ttk.Spinbox(opts, from_=0, to=1048576, width=8,
                     textvariable=self.var_minsize).pack(side="left", padx=(6, 18))
-        ttk.Label(opts, text="保留规则").pack(side="left")
+        ttk.Label(opts, text="重复文件保留").pack(side="left")
         self.var_keep = tk.StringVar(value="最早优先")
         ttk.Combobox(opts, width=10, state="readonly", textvariable=self.var_keep,
                      values=["最早优先", "最新优先"]).pack(side="left", padx=6)
-        ttk.Label(opts, text="（单层扫描，不递归；副本标记 (2)/副本/copy 优先隔离）").pack(side="left", padx=(10, 0))
+        ttk.Label(opts, text="（带 (2)/副本/copy 标记的优先算作重复）",
+                  foreground="#5F5E5A").pack(side="left", padx=(10, 0))
 
         btns = ttk.Frame(wrap)
         btns.pack(fill="x", pady=10)
-        self.btn_scan = ttk.Button(btns, text="① 分析（只读）", command=self._on_scan)
-        self.btn_scan.pack(side="left")
-        self.btn_apply = ttk.Button(btns, text="② 执行计划", command=self._on_apply, state="disabled")
-        self.btn_apply.pack(side="left", padx=8)
-        self.btn_open = ttk.Button(btns, text="打开报告目录", command=self._on_open, state="disabled")
-        self.btn_open.pack(side="left")
+        self.btn_start = ttk.Button(btns, text="开始整理", command=self._on_start)
+        self.btn_start.pack(side="left")
+        self.btn_stop = ttk.Button(btns, text="停止", width=6,
+                                   command=self._on_stop, state="disabled")
+        self.btn_stop.pack(side="left", padx=8)
+        ttk.Label(btns, text="只扫一层目录；关键字命中 → 移动到的目录；内容完全相同 → hash 重复文件",
+                  foreground="#5F5E5A").pack(side="left", padx=(12, 0))
 
         self.log = tk.Text(wrap, height=16, wrap="word", font=("Consolas", 9))
         sb = ttk.Scrollbar(wrap, orient="vertical", command=self.log.yview)
         self.log.configure(yscrollcommand=sb.set, state="disabled")
-        self.log.pack(side="left", fill="both", expand=True)
+        self.log.pack(side="left", fill="both", expand=True, pady=(6, 0))
         sb.pack(side="right", fill="y")
+        self._on_rule_change()
 
     def set_enabled(self, flag):
-        self.btn_scan.config(state="normal" if flag else "disabled")
-        if not flag:
-            self.btn_apply.config(state="disabled")
+        self.btn_start.config(state="normal" if flag else "disabled")
+        self.btn_stop.config(state="disabled")
+
+    def _on_rule_change(self, _ev=None):
+        text = self.var_rule.get().strip()
+        if not text:
+            self.lbl_rule.config(text=_KEYWORD_HINT, foreground="#5F5E5A")
+            return True
+        try:
+            re.compile(text)
+        except re.error as e:
+            self.lbl_rule.config(text="正则无效：%s" % e, foreground="#A32D2D")
+            return False
+        self.lbl_rule.config(text="自定义正则：取第一个匹配，多分组按顺序拼接，结果转小写",
+                             foreground="#0F6E56")
+        return True
+
+    def _reset_rule(self):
+        self.var_rule.set("")
+        self._on_rule_change()
 
     def _pick(self, var):
         d = self.app.fd.askdirectory()
@@ -1020,7 +1032,7 @@ class DedupPage:
             if var is self.var_src:
                 b = os.path.normpath(d)
                 self.var_dst.set(b + "_sorted")
-                self.var_quar.set(b + "_dup_quarantine")
+                self.var_quar.set(b + "_dup_hash")
 
     def _log(self, msg):
         self.log.configure(state="normal")
@@ -1033,32 +1045,61 @@ class DedupPage:
             self._log(payload)
         elif kind == "prog":
             d, t = payload
-            self.app.progress_det(d, t, f"哈希计算中 {d}/{t}（{self.app.var_algo.get()}）")
+            self.app.progress_det(d, t, f"哈希校验中 {d}/{t}（{self.app.var_algo.get()}）")
+        elif kind == "ready":
+            self.app.root.after_idle(self._confirm, payload)
+        elif kind == "mprog":
+            d, t = payload
+            self.app.progress_det(d, t, f"移动中 {d}/{t}")
         elif kind == "done":
-            self._scanned(payload)
-        elif kind == "applied":
-            self._applied(payload)
+            self._finished(payload)
         elif kind == "error":
             self.app.release()
+            self.app.progress_done()
             self._log("[x] " + payload)
             self.app.set_status("出错，见日志")
             self.app.mb.showerror(APP, payload)
 
-    def _on_scan(self):
+    def _paths(self):
         src = self.var_src.get().strip()
-        if not src or not os.path.isdir(src):
-            self.app.mb.showerror(APP, "请先选择有效的源目录")
-            return
         dst = self.var_dst.get().strip()
         quar = self.var_quar.get().strip()
-        if not dst:
+        if src and not dst:
             dst = os.path.abspath(src) + "_sorted"
-        if not quar:
-            quar = os.path.abspath(src) + "_dup_quarantine"
+        if src and not quar:
+            quar = os.path.abspath(src) + "_dup_hash"
         self.var_dst.set(dst)
         self.var_quar.set(quar)
-        if _norm(dst) == _norm(src) or _norm(quar) == _norm(src):
-            self.app.mb.showerror(APP, "目标目录/隔离区不能与源目录相同")
+        return src, dst, quar
+
+    def _check_paths(self, src, dst, quar):
+        """三个路径两两检查：相等或互相包含都拒绝执行。"""
+        problems = []
+        if not src or not os.path.isdir(src):
+            problems.append("待整理目录无效或不存在")
+        for label, p in (("移动到的目录", dst), ("hash 重复文件", quar)):
+            if not p:
+                problems.append(f"请填写「{label}」")
+        if problems:
+            return problems
+        for n1, p1, n2, p2 in (("待整理目录", src, "移动到的目录", dst),
+                               ("待整理目录", src, "hash 重复文件", quar),
+                               ("移动到的目录", dst, "hash 重复文件", quar)):
+            if _norm(p1) == _norm(p2):
+                problems.append(f"「{n1}」与「{n2}」不能是同一个目录")
+            elif _overlap(p1, p2):
+                problems.append(f"「{n1}」与「{n2}」不能互相包含（一个是另一个的子目录）")
+        return problems
+
+    def _on_start(self):
+        src, dst, quar = self._paths()
+        problems = self._check_paths(src, dst, quar)
+        if problems:
+            self.app.mb.showerror(APP, "路径设置有冲突，未执行：\n\n· "
+                                  + "\n· ".join(problems))
+            return
+        if not self._on_rule_change():
+            self.app.mb.showerror(APP, "关键字正则无效，请修正后再试")
             return
         try:
             workers = max(1, int(self.app.var_workers.get()))
@@ -1068,96 +1109,89 @@ class DedupPage:
             return
         if not self.app.acquire(self):
             return
-        self.app.stop.clear()
-        self.btn_apply.config(state="disabled")
-        self.app.progress_start("分析中…（只读）")
+        rule = self.var_rule.get().strip()
+        config.set_value(self.cfg, "dedup.keyword_rule", rule)
+        if not config.save(self.cfg):
+            self._log("[!] 配置保存失败（程序目录不可写），正则不会被记住")
+        self.cancel.clear()
+        self.btn_stop.config(state="normal")
+        self.app.progress_start("分析中…")
         algo = self.app.var_algo.get()
         keep = self.var_keep.get()
         post = self.app.post
 
         def work():
             try:
-                r = dedup_analyze(src, dst, quar, workers, min_kb * 1024, keep, algo,
+                r = dedup_analyze(src, dst, quar, workers, min_kb * 1024, keep, algo, rule,
                                   on_log=lambda m: post(self.tag, "log", m),
-                                  on_progress=lambda d, t: post(self.tag, "prog", (d, t)))
-                post(self.tag, "done", r)
+                                  on_progress=lambda d, t: post(self.tag, "prog", (d, t)),
+                                  cancel=self.cancel)
+                post(self.tag, "ready", r)
             except Exception:
                 post(self.tag, "error", traceback.format_exc())
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _scanned(self, r):
-        self.app.release()
-        self.result = r
-        self.app.progress_done()
-        c = r["counts"]
-        self.app.set_status(f"分析完成：{r['items']} 个文件，{r['groups']} 个重复组，"
-                            f"待移动 {c.get('移动', 0)}，待隔离 {c.get('隔离', 0)}")
-        self.btn_apply.config(state="normal")
-        self.btn_open.config(state="normal")
-
-    def _on_apply(self):
-        if not self.result:
+    def _confirm(self, r):
+        if r.get("stopped"):
+            self.app.release()
+            self.app.progress_done()
+            self._log("[i] 已停止，未移动任何文件")
+            self.app.set_status("整理已停止")
             return
-        src = self.var_src.get().strip()
-        dst = self.var_dst.get().strip()
-        quar = self.var_quar.get().strip()
-        if not src:
-            self.app.mb.showerror(APP, "源目录为空，请重新分析")
+        c, dst, quar = r["counts"], r["dst"], r["quar"]
+        lines = ["即将把文件移动到两个目录（不删除、不改名）：", "",
+                 f"· 关键字命中 {c.get('移动', 0)} 个 → {dst}",
+                 f"· 内容完全相同 {c.get('隔离', 0)} 个 → {quar}",
+                 f"· 不动 {c.get('不动', 0)} 个"]
+        for label, d in (("移动到的目录", dst), ("hash 重复文件", quar)):
+            if os.path.isdir(d) and os.listdir(d):
+                lines.append(f"· 提示：{label} 已有内容，将追加进去，同名文件跳过")
+        sample = [x for x in r["rows"] if x["动作"] != "不动"][:10]
+        if sample:
+            lines += ["", f"示例（前 {len(sample)} 个）："]
+            for x in sample:
+                lines.append("  %s → %s" % (
+                    x["文件名"],
+                    "hash 重复文件" if x["动作"] == "隔离" else "移动到的目录"))
+        lines += ["", "⚠️ 确认继续？"]
+        if not self.app.mb.askyesno("确认整理", "\n".join(lines), icon="warning"):
+            self.app.release()
+            self.app.progress_done()
+            self._log("[i] 已取消，未移动任何文件")
+            self.app.set_status("整理已取消")
             return
-        if not dst:
-            dst = os.path.abspath(src) + "_sorted"
-            self.var_dst.set(dst)
-        if not quar:
-            quar = os.path.abspath(src) + "_dup_quarantine"
-            self.var_quar.set(quar)
-        if _norm(dst) == _norm(src) or _norm(quar) == _norm(src):
-            self.app.mb.showerror(APP, "目标目录/隔离区不能与源目录相同")
-            return
-        if _norm(dst) == _norm(quar):
-            self.app.mb.showerror(APP, "目标目录与隔离区不能相同")
-            return
-        c = self.result["counts"]
-        msg = (f"即将执行不可逆操作：\n\n"
-               f"· 隔离 {c.get('隔离', 0)} 个重复副本 → {quar}\n"
-               f"· 移动 {c.get('移动', 0)} 个文件 → {dst}\n\n"
-               f"⚠️ 请先确认 plan.csv 内容正确！\n确定继续？")
-        if not self.app.mb.askyesno("确认执行", msg, icon="warning"):
-            self._log("[i] 已取消执行")
-            return
-        if not self.app.acquire(self):
-            return
-        r = self.result
-        plan = r["plan"]
-        rebase = (r.get("dst"), r.get("quar"))
-        if rebase[0] and _norm(rebase[0]) != _norm(dst):
-            self._log(f"[i] 目标目录已更改，计划表路径将按新目录改写：{rebase[0]} -> {dst}")
-        if rebase[1] and _norm(rebase[1]) != _norm(quar):
-            self._log(f"[i] 隔离区已更改，计划表路径将按新目录改写：{rebase[1]} -> {quar}")
-        post = self.app.post
+        self.app.progress_det(0, 1, "移动中…")
+        post, rows = self.app.post, r["rows"]
 
         def work():
             try:
-                res = dedup_apply(plan, dst, quar, on_log=lambda m: post(self.tag, "log", m),
-                                  rebase=rebase)
-                post(self.tag, "applied", res)
+                res = dedup_execute(rows, dst, quar,
+                                    on_log=lambda m: post(self.tag, "log", m),
+                                    on_progress=lambda d, t: post(self.tag, "mprog", (d, t)),
+                                    cancel=self.cancel)
+                post(self.tag, "done", res)
             except Exception:
                 post(self.tag, "error", traceback.format_exc())
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _applied(self, r):
+    def _on_stop(self):
+        if self.app.busy:
+            self.cancel.set()
+            self.btn_stop.config(state="disabled")
+            self._log("[i] 正在停止…")
+
+    def _finished(self, res):
         self.app.release()
         self.app.progress_done()
-        self.app.set_status(f"执行完成：成功 {r['moved']} 个，失败 {len(r['failed'])} 个")
-        self.btn_apply.config(state="disabled")
-
-    def _on_open(self):
-        if self.result:
-            try:
-                os.startfile(self.result["report_dir"])
-            except Exception as e:
-                self._log(f"[!] 打开失败：{e}")
+        msg = "整理完成：移动 %d，跳过 %d，失败 %d" % (res["moved"], res["skipped"], res["failed"])
+        if res["stopped"]:
+            msg += "（已中断）"
+        self.app.set_status(msg)
+        self._log("[OK] " + msg)
+        if res["failed"]:
+            self.app.mb.showwarning(APP, "有 %d 个文件移动失败，明细见下方日志" % res["failed"])
 
 
 class App:
@@ -1199,20 +1233,47 @@ class App:
         self.pb = ttk.Progressbar(bottom, mode="determinate", maximum=100)
         self.pb.pack(fill="x", pady=(10, 4))
         self.lbl = ttk.Label(bottom, text=f"File Toolkit v{VER}　|　"
-                                          f"查重清理 · 关键字整理 · 媒体索引 · 照片重命名　|　任一处任务运行时其他页签暂停")
+                                          f"查重清理 · 查重(关键字) · 媒体索引 · 照片重命名　|　任一处任务运行时其他页签暂停")
         self.lbl.pack(fill="x")
 
         self.nb = ttk.Notebook(outer)
         self.nb.pack(fill="both", expand=True, pady=(10, 0))
         self.chk = CheckerPage(self.nb, self)
         self.ded = DedupPage(self.nb, self)
-        self.med = MediaPage(self.nb, self)
+        self.med = None                 # 首次切到该页签才建库，见 _ensure_media
+        self.med_holder = ttk.Frame(self.nb)
+        self.med_failed = False
         self.photo = PhotoPage(self.nb, self)
         self.nb.add(self.chk.frame, text="  查重清理  ")
-        self.nb.add(self.ded.frame, text="  关键字整理  ")
-        self.nb.add(self.med.frame, text="  媒体索引  ")
+        self.nb.add(self.ded.frame, text="  查重(关键字)  ")
+        self.nb.add(self.med_holder, text="  媒体索引  ")
         self.nb.add(self.photo.frame, text="  照片重命名  ")
-        self.pages = {"chk": self.chk, "ded": self.ded, "med": self.med, "photo": self.photo}
+        self.pages = {"chk": self.chk, "ded": self.ded, "photo": self.photo}
+        self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+
+    def _on_tab_changed(self, _ev=None):
+        try:
+            if self.nb.index(self.nb.select()) == 2:
+                self._ensure_media()
+        except self.tk.TclError:
+            pass
+
+    def _ensure_media(self):
+        """媒体索引页首次进入时才建库；建库失败只影响这一页，其余页签照常可用。"""
+        if self.med is not None or self.med_failed:
+            return
+        try:
+            self.med = MediaPage(self.med_holder, self)
+        except Exception as e:
+            self.med_failed = True
+            self.med = None
+            self.ttk.Label(self.med_holder, justify="left", foreground="#A32D2D",
+                           text="媒体索引不可用：索引库无法创建（目录可能不可写）\n%s" % e
+                           ).pack(padx=20, pady=40)
+            self.mb.showerror(APP, "媒体索引不可用：无法创建/打开索引库。\n%s\n\n其余页签不受影响。" % e)
+            return
+        self.med.frame.pack(fill="both", expand=True)
+        self.pages["med"] = self.med
 
     def post(self, tag, kind, payload=None):
         self.q.put((tag, kind, payload))
@@ -1244,26 +1305,23 @@ class App:
             return False
         self.busy = True
         self.owner = page
-        self.chk.set_enabled(False)
-        self.ded.set_enabled(False)
-        self.med.set_enabled(False)
-        self.photo.set_enabled(False)
+        for p in (self.chk, self.ded, self.med, self.photo):
+            if p is not None:
+                p.set_enabled(False)
         return True
 
     def release(self):
         owner = self.owner
         self.busy = False
         self.owner = None
-        self.chk.set_enabled(True)
-        self.ded.set_enabled(True)
-        self.med.set_enabled(True)
-        self.photo.set_enabled(True)
+        for p in (self.chk, self.ded, self.med, self.photo):
+            if p is not None:
+                p.set_enabled(True)
         if getattr(owner, "tag", "") != "med":
             self.pb.stop()
             self.pb.config(mode="determinate")
             self.pb["value"] = 100
         self.chk.btn_stop.config(state="disabled")
-        self.ded.btn_apply.config(state="normal" if self.ded.result else "disabled")
 
     def set_status(self, text):
         self.lbl.config(text=text)
@@ -1333,105 +1391,9 @@ class App:
         self.root.mainloop()
 
 
-# ---------------------------------------------------------------- 命令行（回归验证用）
-
-def _selftest_checker(base, extra=None, dst=None, only_extra=True):
-    stop = threading.Event()
-    rows, skipped = scan_tree(os.path.abspath(base), 1024, False, stop, SRC_BASE, lambda n: None)
-    if extra:
-        more, sk2 = scan_tree(os.path.abspath(extra), 1024, False, stop, SRC_EXTRA, lambda n: None)
-        rows += more
-        for k, v in sk2.items():
-            skipped[k] = skipped.get(k, 0) + v
-    groups = checker_groups(rows, 4, stop, DEFAULT_ALGO, only_extra, lambda d, t: None)
-    lines = [f"mode={'only_extra' if only_extra else 'all'} files={len(rows)} groups={len(groups)}",
-             f"skipped={skipped}"]
-    for g in groups:
-        lines.append(f"group size={g['size']} n={len(g['members'])} hash={g['hash'][:12]}")
-        for m in g["members"]:
-            tag = "KEPT" if m["kept"] else ("drop" if m["deletable"] else "----")
-            lines.append(f"  {tag} [{m['src']}] {m['path']}")
-    if dst:
-        res = checker_execute(checker_plan(groups), dst, stop, lambda d, t: None,
-                              DEFAULT_ALGO, only_extra)
-        lines.append(f"removed ok={res['ok']} fail={res['fail']} copied={res['copied']}")
-    out = os.path.join(os.environ.get("TEMP", "."), "sfc_selftest.txt")
-    with open(out, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
-    return 0
-
-
-def _safe_streams():
-    for s in (sys.stdout, sys.stderr):
-        try:
-            s.reconfigure(encoding="utf-8", errors="replace")
-        except Exception:
-            pass
-
-
-def _dump_error(tb):
-    try:
-        p = os.path.join(os.environ.get("TEMP", "."), "filetoolkit_cli_error.txt")
-        with open(p, "w", encoding="utf-8") as f:
-            f.write(tb)
-    except OSError:
-        pass
-
-
-def _cli_dedup(argv):
-    _safe_streams()
-    args = {"--workers": 8, "--min-size": 0, "--keep": "最早优先", "--algo": DEFAULT_ALGO}
-    flags = set()
-    i = 0
-    while i < len(argv):
-        a = argv[i]
-        if a.startswith("--") and i + 1 < len(argv) and not argv[i + 1].startswith("--"):
-            args[a] = argv[i + 1]
-            i += 2
-        else:
-            flags.add(a)
-            i += 1
-    src = args.get("--src")
-    if not src:
-        print("用法: FileToolkit.exe --cli --src <目录> [--apply] [--algo xxh3-128] [--min-size KB]")
-        return 1
-    src = os.path.abspath(src)
-    dst = os.path.abspath(args.get("--dst") or src + "_sorted")
-    quar = os.path.abspath(args.get("--quarantine") or src + "_dup_quarantine")
-    r = dedup_analyze(src, dst, quar, int(args["--workers"]),
-                      max(0, int(args["--min-size"])) * 1024,
-                      args["--keep"], args["--algo"], on_log=print,
-                      on_progress=lambda d, t: None)
-    if "--apply" in flags:
-        dedup_apply(r["plan"], dst, quar, on_log=print)
-    return 0
-
-
-def _argv_value(flag):
-    """命令行选项 flag 的后继参数；缺失或位于末尾时返回 None。"""
-    if flag not in sys.argv:
-        return None
-    i = sys.argv.index(flag)
-    return sys.argv[i + 1] if i + 1 < len(sys.argv) else None
-
+# ---------------------------------------------------------------- 入口
 
 def main():
-    if "--selftest" in sys.argv:
-        i = sys.argv.index("--selftest")
-        if i + 1 >= len(sys.argv):
-            print("用法: FileToolkit.exe --selftest <目录> [--extra <目录>] [--apply <目录>] [--all]")
-            return 2
-        extra = _argv_value("--extra")
-        dst = _argv_value("--apply")
-        return _selftest_checker(sys.argv[i + 1], extra, dst, "--all" not in sys.argv)
-    if "--cli" in sys.argv:
-        try:
-            return _cli_dedup(sys.argv[sys.argv.index("--cli") + 1:])
-        except Exception:
-            tb = traceback.format_exc()
-            _dump_error(tb)
-            print(tb, file=sys.stderr)
-            return 1
     try:
         App().run()
     except Exception:

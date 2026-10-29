@@ -64,21 +64,24 @@ dist/
   在拦截该行为的机器上会报 `Could not create temporary directory`
 - 实测 `D:` 盘会拦截 onefile 的自解压（`Could not create temporary directory`），`C:` 盘正常；
   `D:` 盘请用 onedir 版
-- `--windowed` 的产物没有控制台，stdout 不可见；异常看 `%TEMP%\filetoolkit_cli_error.txt`
+- `--windowed` 的产物没有控制台，stdout 不可见；启动异常会弹错误框，运行期问题见各页签日志区
 - `dist\media_index.db` 若来自冒烟测试可删，首次运行会自动在 exe 同级重建
 - `dist\config.json` 是照片重命名页的配置，可删，首次运行自动创建
 - 重新打包不会继承签名，**每次打包后需重新签名**（若已启用代码签名）
 
 ## 冒烟验证
 
-打包后建议各跑一次：
+v20261029 起**没有命令行参数**（`--cli` / `--selftest` 已移除），冒烟全靠 GUI：
 
 ```bat
 :: GUI 能起来（进程存活即通过）
 start "" dist\FileToolkit_onedir.exe
-
-:: CLI 参数保护（缺参应打印用法并返回 2）
-dist\FileToolkit_onefile.exe --selftest
 ```
 
-GUI 起来后会在 exe 同级生成 `media_index.db`，说明启动链路完整。
+起来后按这个顺序点一遍（用测试目录，别用真实数据）：
+
+1. exe 同级生成 `media_index.db` → 启动链路完整
+2. 查重清理页：选一个含 2 份相同文件的测试目录 → 扫描 → 结果里有 1 组、★ 与 ☑ 正确 → 点「移除」走一遍确认框（可选）
+3. 查重(关键字)页：选测试目录 → 故意把「移动到的目录」设成它的子目录 → 应直接弹"路径设置有冲突"
+4. 照片重命名页：3~5 张测试图 → 分析 → 计划表有行 → 执行 2~3 条
+5. 媒体索引页：选一个小目录扫描 → 列表里出现该路径

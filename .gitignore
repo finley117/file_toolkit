@@ -5,6 +5,7 @@ build_*/
 *.spec
 
 # 运行产物
+config.json
 media_index.db
 *.db-journal
 *.db-wal

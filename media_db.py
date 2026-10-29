@@ -160,6 +160,10 @@ def list_paths(c):
                      'ORDER BY id').fetchall()
 
 
+def path_exists(c, path_id):
+    return c.execute('SELECT 1 FROM scan_paths WHERE id=?', (path_id,)).fetchone() is not None
+
+
 def find_duplicates(c):
     rows = c.execute(
         'SELECT k.word, COUNT(DISTINCT f.id) '

@@ -8,6 +8,7 @@ import os
 import threading
 import tkinter as tk
 import traceback
+from datetime import datetime
 from tkinter import filedialog, messagebox, ttk
 
 import config
@@ -90,10 +91,9 @@ class PhotoPage:
         self.btn_stop.pack(side="left", padx=(6, 8))
         self.btn_apply = ttk.Button(btns, text="② 执行计划", command=self._on_apply, state="disabled")
         self.btn_apply.pack(side="left", padx=8)
-        self.btn_open = ttk.Button(btns, text="打开计划表", command=self._open_plan, state="disabled")
+        self.btn_open = ttk.Button(btns, text="打开报告目录", command=self.open_plan_dir,
+                                   state="disabled")
         self.btn_open.pack(side="left")
-        self.btn_ledger = ttk.Button(btns, text="打开台账", command=self._open_ledger, state="disabled")
-        self.btn_ledger.pack(side="left", padx=8)
         ttk.Separator(btns, orient="vertical").pack(side="left", fill="y", padx=6)
         self.btn_remove = ttk.Button(btns, text="移除选中", width=9,
                                      command=self._remove_selected, state="disabled")
@@ -159,7 +159,7 @@ class PhotoPage:
         config.set_value(self.cfg, "photo.date_basis", self.var_basis.get())
         config.set_value(self.cfg, "photo.alternate_date", self.var_alt.get())
         config.set_value(self.cfg, "photo.skip_extensions", self.var_skip.get())
-        config.save(self.cfg)
+        return config.save(self.cfg)
 
     def open_plan_dir(self):
         if self.result and self.result.get("report_dir"):
@@ -167,12 +167,6 @@ class PhotoPage:
                 os.startfile(self.result["report_dir"])
             except OSError as e:
                 messagebox.showerror("打开失败", str(e))
-
-    def _open_plan(self):
-        self.open_plan_dir()
-
-    def _open_ledger(self):
-        self.open_plan_dir()
 
     # ---------------------------------------------------------------- 互斥钩子
 
@@ -183,8 +177,7 @@ class PhotoPage:
         except tk.TclError:
             pass
         if not flag:
-            for w in (self.btn_apply, self.btn_open, self.btn_ledger,
-                      self.btn_remove, self.btn_stop):
+            for w in (self.btn_apply, self.btn_open, self.btn_remove, self.btn_stop):
                 try:
                     w.config(state="disabled")
                 except tk.TclError:
@@ -194,7 +187,6 @@ class PhotoPage:
             try:
                 self.btn_apply.config(state="normal" if self.result else "disabled")
                 self.btn_open.config(state="normal" if self.result else "disabled")
-                self.btn_ledger.config(state="normal" if self.result else "disabled")
                 self.btn_remove.config(state="normal" if has_rows else "disabled")
                 self.btn_stop.config(state="disabled")
             except tk.TclError:
@@ -229,7 +221,8 @@ class PhotoPage:
         if not self.app.acquire(self):
             return
 
-        self._save_cfg()
+        if not self._save_cfg():
+            self._log("[!] 配置保存失败（程序目录不可写），本次设置不会被记住")
         self.tree.delete(*self.tree.get_children())
         self.result = None
         self.excluded.clear()
@@ -237,7 +230,6 @@ class PhotoPage:
         self.btn_stop.config(state="normal")
         self.btn_apply.config(state="disabled")
         self.btn_open.config(state="disabled")
-        self.btn_ledger.config(state="disabled")
         self.btn_remove.config(state="disabled")
         self.app.progress_start("分析中…（只读）")
 
@@ -263,17 +255,20 @@ class PhotoPage:
                     on_progress=lambda d, t: post(self.tag, "prog", (d, t)),
                     on_log=lambda m: post(self.tag, "log", m),
                     cancel=self.cancel)
-                if self.cancel.is_set():
-                    post(self.tag, "log", "[i] 分析已停止")
                 rd = photo_rename.report_dir_for(src)
                 try:
                     os.makedirs(rd, exist_ok=True)
                 except OSError as e:
                     raise RuntimeError("无法创建报告目录：%s" % e)
-                plan = os.path.join(rd, "plan.csv")
+                stopped = self.cancel.is_set()
+                name = ("plan_partial_%s.csv" % datetime.now().strftime("%Y%m%d_%H%M%S")
+                        if stopped else "plan.csv")
+                plan = os.path.join(rd, name)
                 photo_rename.write_plan_csv(rows, plan)
-                post(self.tag, "log", "[i] 计划已写出：%s" % plan)
-                post(self.tag, "done", {"rows": rows, "plan": plan, "report_dir": rd})
+                post(self.tag, "log", "[i] %s：%s"
+                     % ("分析已停止，只写出部分计划" if stopped else "计划报表已写出", plan))
+                post(self.tag, "done", {"rows": rows, "plan": plan, "report_dir": rd,
+                                        "stopped": stopped})
             except Exception:
                 post(self.tag, "error", traceback.format_exc())
 
@@ -288,6 +283,11 @@ class PhotoPage:
         self._refresh_table()
         ok_n = sum(1 for r in result["rows"] if r["状态"] == "ok")
         skip_n = len(result["rows"]) - ok_n
+        if result.get("stopped"):
+            self.btn_apply.config(state="disabled")
+            self._log("[!] 分析已停止，结果不完整，未生成可执行计划；请重新分析")
+            self.app.set_status("照片重命名：分析已停止（结果不完整），不能执行")
+            return
         self.app.set_status("照片重命名：可执行 %d，跳过 %d" % (ok_n, skip_n))
 
     def _visible_rows(self):
@@ -364,7 +364,8 @@ class PhotoPage:
                % (len(ok_rows), skip_n))
         if excluded_n:
             msg += "已手动移除 %d 条，不会执行\n" % excluded_n
-        msg += "\n⚠️ 请先核对 plan.csv：%s\n确定继续？" % self.result["plan"]
+        msg += ("\n⚠️ 执行依据是本次分析在内存里的结果，修改 plan.csv 不会影响执行。\n"
+                "计划报表（仅供核对）：%s\n\n确定继续？" % self.result["plan"])
         if not self.app.mb.askyesno("确认执行", msg, icon="warning"):
             self._log("[i] 已取消执行")
             return
@@ -374,23 +375,12 @@ class PhotoPage:
         self.btn_stop.config(state="normal")
         self.app.progress_start("执行中…")
         post = self.app.post
-        plan = self.result["plan"]
+        report_dir = self.result["report_dir"]
 
         def work():
             try:
-                # 把「手动移除」的条目状态改成 skip，再写回计划表，
-                # 这样 apply_plan 只需按表执行，不必再关心排除集合。
-                if self.excluded:
-                    rows = photo_rename.read_plan_csv(plan)
-                    for r in rows:
-                        full = os.path.join(r.get("所在目录", ""), r.get("原文件名", ""))
-                        if full in self.excluded and r.get("状态") == "ok":
-                            r["状态"] = "skip"
-                            r["原因"] = "用户手动移除"
-                    photo_rename.write_plan_csv(rows, plan)
-                    post(self.tag, "log", "[i] 已将 %d 条标记为跳过" % excluded_n)
                 res = photo_rename.apply_plan(
-                    plan,
+                    ok_rows, report_dir,
                     on_progress=lambda d, t: post(self.tag, "prog", (d, t)),
                     on_log=lambda m: post(self.tag, "log", m),
                     cancel=self.cancel)
@@ -405,7 +395,7 @@ class PhotoPage:
         self.app.progress_done()
         self.btn_stop.config(state="disabled")
         self.btn_apply.config(state="disabled")
-        self.btn_ledger.config(state="normal")
+        self.btn_open.config(state="normal")
         parts = ["成功 %d" % res["moved"], "失败 %d" % res["failed"]]
         if res.get("stopped"):
             parts.append("未处理 %d" % res.get("skipped", 0))

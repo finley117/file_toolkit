@@ -29,6 +29,9 @@ RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL"} | {
 }
 MAX_STEM_LEN = 120
 
+# 这些 Warning 属于"正常缺失"，不进异常汇总（仍写入每行的原因列）
+_NORMAL_WARNINGS = {"无 EXIF", "格式无 EXIF", "EXIF 无拍摄日期"}
+
 PLAN_FIELDS = ["序号", "所在目录", "原文件名", "新文件名", "拍摄日期",
                "相机", "状态", "原因", "大小"]
 MANIFEST_FIELDS = ["时间", "动作", "所在目录", "原文件名", "新文件名", "结果", "说明"]
@@ -49,8 +52,11 @@ def validate_template(tpl):
         shown = " ".join(repr(c) for c in bad)
         return False, "模板含非法字符：%s" % shown
 
+    tokens, rest = _split_braces(tpl)
+    if "{" in rest or "}" in rest:
+        return False, "花括号未配对"
     known = {name for name, _ in TEMPLATE_VARS}
-    for token in _iter_braces(tpl):
+    for token in tokens:
         if token not in known:
             return False, "未知变量：%s" % token
 
@@ -65,22 +71,29 @@ def validate_template(tpl):
     return True, ""
 
 
-def _iter_braces(tpl):
-    """逐个取出 {xxx} 形式的 token。"""
-    out, buf, depth = [], [], 0
+def _split_braces(tpl):
+    """拆出 {xxx} 形式的 token，并返回未配对的残留文本。
+
+    残留里只要还有花括号，就说明模板存在未闭合或多余的括号。
+    """
+    tokens, rest, buf, depth = [], [], [], 0
     for ch in tpl:
-        if ch == "{":
-            depth += 1
-            if depth == 1:
-                buf = ["{"]
-                continue
         if depth:
             buf.append(ch)
-            if ch == "}":
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
                 depth -= 1
                 if depth == 0:
-                    out.append("".join(buf))
-    return out
+                    tokens.append("".join(buf))
+                    buf = []
+        elif ch == "{":
+            depth = 1
+            buf = ["{"]
+        else:
+            rest.append(ch)
+    rest.extend(buf)
+    return tokens, "".join(rest)
 
 
 def build_stem(tpl, meta, ext, original=""):
@@ -253,6 +266,7 @@ def plan_renames(paths, tpl, date_basis=None, alternate=None, workers=None,
     )
 
     rows = []
+    warn_stat = {}
     for idx, path in enumerate(paths, 1):
         name = os.path.basename(path)
         directory = os.path.dirname(path)
@@ -264,6 +278,9 @@ def plan_renames(paths, tpl, date_basis=None, alternate=None, workers=None,
             pass
 
         meta = metas.get(path) or photo_media.empty_meta("读取失败")
+        warn = (meta.get("Warning") or "").strip()
+        if warn and warn not in _NORMAL_WARNINGS:
+            warn_stat[warn] = warn_stat.get(warn, 0) + 1
         dt, why = photo_media.resolve_date(path, meta, date_basis, alternate)
 
         row = {
@@ -279,7 +296,10 @@ def plan_renames(paths, tpl, date_basis=None, alternate=None, workers=None,
         }
 
         if dt is None:
-            row["原因"] = why or "无可用日期"
+            note = why or "无可用日期"
+            if warn and warn not in note:
+                note += "（%s）" % warn
+            row["原因"] = note
             rows.append(row)
             continue
 
@@ -311,6 +331,10 @@ def plan_renames(paths, tpl, date_basis=None, alternate=None, workers=None,
     skip_n = total - ok_n
     if on_log:
         on_log("[i] 计划完成：可执行 %d，跳过 %d" % (ok_n, skip_n))
+        if warn_stat:
+            detail = "，".join("%s %d" % (k, v) for k, v in
+                              sorted(warn_stat.items(), key=lambda kv: (-kv[1], kv[0])))
+            on_log("[!] 元数据异常 %d 个文件：%s" % (sum(warn_stat.values()), detail))
     return rows
 
 
@@ -333,24 +357,20 @@ def write_plan_csv(rows, path):
     return path
 
 
-def read_plan_csv(path):
-    with open(path, "r", newline="", encoding="utf-8-sig") as f:
-        return list(csv.DictReader(f))
+def apply_plan(rows, report_dir, on_progress=None, on_log=None, cancel=None):
+    """阶段二：按内存里的计划重命名，写 manifest_<时间戳>.csv。
 
-
-def apply_plan(plan_path, on_progress=None, on_log=None, cancel=None):
-    """阶段二：按计划表执行重命名，写 manifest.csv。
-
-    cancel 为 threading.Event，置位后停止后续条目（已完成的保留在台账里）。
+    plan.csv 只是核对报表，执行不回读它；cancel 为 threading.Event，
+    置位后停止后续条目（已完成的保留在台账里）。
     """
     import datetime
 
-    rows = read_plan_csv(plan_path)
     todo = [r for r in rows if (r.get("状态") or "").strip() == "ok"]
     if on_log:
         on_log("[i] 待执行 %d 条" % len(todo))
 
-    manifest_path = os.path.join(os.path.dirname(plan_path), "manifest.csv")
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    manifest_path = os.path.join(report_dir, "manifest_%s.csv" % stamp)
     done = failed = skipped = 0
     total = len(todo)
     stopped = False
@@ -369,6 +389,7 @@ def apply_plan(plan_path, on_progress=None, on_log=None, cancel=None):
             new_name = r.get("新文件名", "")
             src = os.path.join(directory, old_name)
             dst = os.path.join(directory, new_name)
+            size = r.get("大小") or 0
             rec = {
                 "时间": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "动作": "重命名",
@@ -381,6 +402,8 @@ def apply_plan(plan_path, on_progress=None, on_log=None, cancel=None):
             try:
                 if not os.path.isfile(src):
                     raise FileNotFoundError("源文件已不存在")
+                if size and os.path.getsize(src) != int(size):
+                    raise RuntimeError("文件已变化（大小不符）")
                 if os.path.exists(dst) and os.path.normcase(src) != os.path.normcase(dst):
                     raise FileExistsError("目标已存在")
                 os.rename(src, dst)
