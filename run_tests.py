@@ -17,9 +17,13 @@ import threading
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
 
-import file_toolkit as ft            # noqa: E402
 import photo_media                   # noqa: E402
 import photo_rename                  # noqa: E402
+from checker_page import CheckerPage  # noqa: E402
+from common import (DEFAULT_ALGO, SRC_BASE, checker_execute,  # noqa: E402
+                    checker_groups, checker_plan, compile_keyword_rule, copy_mark,
+                    dedup_analyze, dedup_execute, extract_keyword, scan_tree)
+from util import is_drive_root, long_path, paths_overlap  # noqa: E402
 
 PASS = 0
 FAIL = 0
@@ -61,20 +65,20 @@ def mark_hidden(path):
 
 def test_keyword():
     print("关键字提取")
-    check("默认规则 report_2024 -> report2024",
-          ft.extract_keyword("report_2024") == "report2024", ft.extract_keyword("report_2024"))
-    check("字母不足 3 位不命中", ft.extract_keyword("ab_2024") == "",
-          ft.extract_keyword("ab_2024"))
-    prog = ft.compile_keyword_rule(r"(\d{4})")
-    check("自定义正则取第一个匹配", ft.extract_keyword("abc_2024_def", prog) == "2024")
-    check("空规则等于用默认", ft.compile_keyword_rule("  ") is None)
+    check("默认规则 report_2024 -> REPORT2024（字母大写）",
+          extract_keyword("report_2024") == "REPORT2024", extract_keyword("report_2024"))
+    check("字母不足 3 位不命中", extract_keyword("ab_2024") == "",
+          extract_keyword("ab_2024"))
+    prog = compile_keyword_rule(r"(\d{4})")
+    check("自定义正则取第一个匹配", extract_keyword("abc_2024_def", prog) == "2024")
+    check("空规则等于用默认", compile_keyword_rule("  ") is None)
 
 
 def test_copy_mark():
     print("副本标记")
-    check("(2) 认作副本", ft.copy_mark("a (2)") == (True, 2), ft.copy_mark("a (2)"))
-    check("copy 认作副本", ft.copy_mark("a copy") == (True, 1), ft.copy_mark("a copy"))
-    check("普通文件名不算副本", ft.copy_mark("a") == (False, 0))
+    check("(2) 认作副本", copy_mark("a (2)") == (True, 2), copy_mark("a (2)"))
+    check("copy 认作副本", copy_mark("a copy") == (True, 1), copy_mark("a copy"))
+    check("普通文件名不算副本", copy_mark("a") == (False, 0))
 
 
 # ---------------------------------------------------------------- 路径
@@ -82,14 +86,14 @@ def test_copy_mark():
 
 def test_paths():
     print("路径校验")
-    check("父子目录算重叠", ft._overlap(r"D:\a", r"D:\a\b"))
-    check("跨盘不算重叠", not ft._overlap(r"D:\a", r"E:\b"))
-    check("相同目录算重叠", ft._overlap(r"D:\a", r"D:\a"))
-    check("盘根能识别", ft._is_drive_root("D:\\") and not ft._is_drive_root(r"D:\a"))
-    check("短路径不加前缀", ft._long(r"D:\a") == r"D:\a", ft._long(r"D:\a"))
+    check("父子目录算重叠", paths_overlap(r"D:\a", r"D:\a\b"))
+    check("跨盘不算重叠", not paths_overlap(r"D:\a", r"E:\b"))
+    check("相同目录算重叠", paths_overlap(r"D:\a", r"D:\a"))
+    check("盘根能识别", is_drive_root("D:\\") and not is_drive_root(r"D:\a"))
+    check("短路径不加前缀", long_path(r"D:\a") == r"D:\a", long_path(r"D:\a"))
     long_p = "D:\\" + "x" * 250
-    check("长路径加前缀", ft._long(long_p).startswith("\\\\?\\"), ft._long(long_p)[:6])
-    check("加前缀可重复调用", ft._long(ft._long(long_p)) == ft._long(long_p))
+    check("长路径加前缀", long_path(long_p).startswith("\\\\?\\"), long_path(long_p)[:6])
+    check("加前缀可重复调用", long_path(long_path(long_p)) == long_path(long_p))
 
 
 # ---------------------------------------------------------------- 扫描
@@ -105,8 +109,8 @@ def test_scan_skip(tmp):
     hidden = os.path.join(root, "hidden.txt")
     make(hidden, 2000)
     mark_hidden(hidden)
-    rows, skipped = ft.scan_tree(root, 1024, False, threading.Event(),
-                                 ft.SRC_BASE, lambda n: None)
+    rows, skipped = scan_tree(root, 1024, False, threading.Event(),
+                                 SRC_BASE, lambda n: None)
     names = set(os.path.basename(r["path"]) for r in rows)
     check("正常文件被纳入", "keep.txt" in names, names)
     check("子目录里的文件也纳入", "inside.txt" in names, names)
@@ -126,10 +130,10 @@ def test_dedup(tmp):
     make(os.path.join(src, "report_2024_a (2).txt"), 500)
     make(os.path.join(src, "random.txt"), 500, fill=b"y")   # 同大小但内容不同
     dst, quar = os.path.join(tmp, "out"), os.path.join(tmp, "dup")
-    r = ft.dedup_analyze(src, dst, quar, 2, 0, "最早优先", ft.DEFAULT_ALGO, "",
+    r = dedup_analyze(src, dst, quar, 2, 0, "最早优先", DEFAULT_ALGO, "",
                          on_log=lambda m: None)
     check("三类计数正确", r["counts"] == {"移动": 1, "隔离": 1, "不动": 1}, r["counts"])
-    res = ft.dedup_execute(r["rows"], dst, quar, on_log=lambda m: None)
+    res = dedup_execute(r["rows"], dst, quar, on_log=lambda m: None)
     check("移动 2 个且无失败", res["moved"] == 2 and res["failed"] == 0, res)
     check("命中文件进了目标目录", os.listdir(dst) == ["report_2024_a.txt"], os.listdir(dst))
     check("副本进了 hash 目录",
@@ -147,16 +151,16 @@ def test_checker(tmp):
     make(os.path.join(src, "b.txt"), 800)
     make(os.path.join(src, "c.txt"), 900)
     stop = threading.Event()
-    rows, _ = ft.scan_tree(src, 0, False, stop, ft.SRC_BASE, lambda n: None)
-    groups = ft.checker_groups(rows, 2, stop, ft.DEFAULT_ALGO, False, lambda d, t: None)
+    rows, _ = scan_tree(src, 0, False, stop, SRC_BASE, lambda n: None)
+    groups = checker_groups(rows, 2, stop, DEFAULT_ALGO, False, lambda d, t: None)
     check("找到 1 组重复", len(groups) == 1, len(groups))
     if groups:
         kept = sum(1 for m in groups[0]["members"] if m["kept"])
         drop = sum(1 for m in groups[0]["members"] if m["deletable"])
         check("1 个保留、1 个待移除", kept == 1 and drop == 1, (kept, drop))
         out = os.path.join(tmp, "moved")
-        res = ft.checker_execute(ft.checker_plan(groups), out, stop,
-                                 lambda d, t: None, ft.DEFAULT_ALGO, False)
+        res = checker_execute(checker_plan(groups), out, stop,
+                                 lambda d, t: None, DEFAULT_ALGO, False)
         check("移除 1 个且无失败", res["ok"] == 1 and res["fail"] == 0, res)
         check("清单已写出", os.path.isfile(os.path.join(out, "清单.txt")))
 
@@ -171,11 +175,11 @@ def test_param_key():
     p3 = dict(p1, min=2)
     p4 = dict(p1, only=False)
     check("大小写与尾部斜杠算同一组参数",
-          ft.CheckerPage._param_key(p1) == ft.CheckerPage._param_key(p2))
+          CheckerPage._param_key(p1) == CheckerPage._param_key(p2))
     check("最小大小不同则不是同一组",
-          ft.CheckerPage._param_key(p1) != ft.CheckerPage._param_key(p3))
+          CheckerPage._param_key(p1) != CheckerPage._param_key(p3))
     check("比对模式不同则不是同一组",
-          ft.CheckerPage._param_key(p1) != ft.CheckerPage._param_key(p4))
+          CheckerPage._param_key(p1) != CheckerPage._param_key(p4))
 
 
 def test_photo(tmp):

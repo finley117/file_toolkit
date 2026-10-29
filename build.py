@@ -28,8 +28,8 @@ RUNTIME_FILES = ["media_index.db", "config.json"]
 
 
 def read_version():
-    """版本号只在 file_toolkit.py 的 VER 常量里定义，这里读同一处。"""
-    with open(os.path.join(ROOT, "file_toolkit.py"), encoding="utf-8") as f:
+    """版本号只在 common.py 的 VER 常量里定义，这里读同一处。"""
+    with open(os.path.join(ROOT, "common.py"), encoding="utf-8") as f:
         m = re.search(r'^VER\s*=\s*"([^"]+)"', f.read(), re.M)
     return m.group(1) if m else None
 

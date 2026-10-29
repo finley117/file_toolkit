@@ -14,23 +14,24 @@ from tkinter import filedialog, messagebox, ttk
 import config
 import photo_media
 import photo_rename
+from page_base import PageBase
 
 
-class PhotoPage:
+class PhotoPage(PageBase):
     tag = "photo"
 
     def __init__(self, parent, app):
-        self.app = app
+        self.cfg = config.load()     # 要在 super 之前，_build_ui 会读
+        super().__init__(parent, app)
         self.result = None
-        self.cfg = config.load()
         self.cancel = threading.Event()
         self.excluded = set()        # 被用户手动移除的原文件名（全路径）
         self.show_only_ok = tk.BooleanVar(value=False)
-        self._build(parent)
+        self._build_ui(parent)
 
     # ---------------------------------------------------------------- 界面
 
-    def _build(self, parent):
+    def _build_ui(self, parent):
         self.frame = ttk.Frame(parent)
         wrap = ttk.Frame(self.frame, padding=10)
         wrap.pack(fill="both", expand=True)
@@ -73,15 +74,13 @@ class PhotoPage:
         self.cb_alt = ttk.Combobox(row3, width=13, state="readonly", textvariable=self.var_alt,
                                    values=photo_media.ALTERNATE_DATES)
         self.cb_alt.pack(side="left")
-        self._on_basis_change()
 
-        row4 = ttk.Frame(wrap)
-        row4.pack(fill="x", pady=(6, 0))
-        ttk.Label(row4, text="跳过扩展名", width=8).pack(side="left")
+        ttk.Label(row3, text="跳过扩展名", width=10).pack(side="left", padx=(14, 4))
         self.var_skip = tk.StringVar(value=str(config.get_value(self.cfg, "photo.skip_extensions", "")))
-        ttk.Entry(row4, textvariable=self.var_skip, width=40).pack(side="left", padx=8)
-        ttk.Label(row4, text="（空格或逗号分隔，如 mp4 .mov；留空则不过滤）",
+        ttk.Entry(row3, textvariable=self.var_skip, width=22).pack(side="left", padx=4)
+        ttk.Label(row3, text="（空格/逗号分隔，如 mp4 .mov；留空不过滤）",
                   foreground="#5F5E5A").pack(side="left")
+        self._on_basis_change()
 
         btns = ttk.Frame(wrap)
         btns.pack(fill="x", pady=10)

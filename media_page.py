@@ -11,16 +11,16 @@ from tkinter import ttk, filedialog, messagebox, simpledialog
 import media_db as db
 import media_query
 import media_scanner as scanner
-from fsops import transfer
+from page_base import PageBase
+from util import transfer
 
 
-class MediaPage:
+class MediaPage(PageBase):
     tag = "med"
 
     def __init__(self, parent, app):
-        self.app = app
-        self.root = app.root
         self.frame = ttk.Frame(parent)
+        super().__init__(parent, app)
         self.scan_cancel = None
         self.scan_thread = None
         self.dups = []
@@ -34,7 +34,7 @@ class MediaPage:
         rule = db.get_rule(c)
         stale = db.needs_rebuild(c)
         c.close()
-        self._build_ui()
+        self._build_ui(parent)
         self._refresh_paths()
         self.rule_entry.insert(0, rule)
         if normalized:
@@ -43,7 +43,7 @@ class MediaPage:
             self.log_msg('检测到关键字规则未应用, 将在后台重建...')
             self.root.after(200, self._auto_apply_rule, rule)
 
-    def _build_ui(self):
+    def _build_ui(self, parent):
         frm = ttk.Frame(self.frame)
         frm.pack(fill='x', padx=10, pady=(10, 6))
         self.btn_add = ttk.Button(frm, text='增加路径', command=self.add_path)

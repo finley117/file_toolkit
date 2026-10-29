@@ -47,7 +47,7 @@ DEFAULTS = {
         "src": "",
         "dst": "",
         "quar": "",
-        "min_kb": 0,
+        "min_kb": 1,
         "keep": "最早优先",
     },
 }

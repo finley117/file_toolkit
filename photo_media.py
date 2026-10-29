@@ -262,7 +262,9 @@ def _meta_from_exifread(path):
     else:
         meta["Warning"] = "EXIF 无拍摄日期"
 
-    meta["Camera"] = tag("Image Model")
+    make = tag("Image Make")
+    model = tag("Image Model")
+    meta["Camera"] = (make + " " + model).strip() if make else model
     meta["Lens"] = tag("EXIF LensModel")
     meta["ISO"] = tag("EXIF ISOSpeedRatings")
     meta["Shutter"] = tag("EXIF ExposureTime")

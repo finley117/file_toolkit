@@ -74,16 +74,21 @@ dist\
 ## 项目结构
 
 ```
-file_toolkit.py        # 入口：共用条、页签容器、查重清理页、查重(关键字)页
+file_toolkit.py        # 入口：共用工具条、页签容器、任务互斥、配置读写
+page_base.py           # 四个页签的共同基类（共享初始化、配置读写、运行锁默认实现）
+common.py              # 业务内核：扫描、哈希、分组、关键字提取、执行、前置检查
+util.py                # 通用工具：路径判断、长路径前缀、移动/复制、大小格式化
+checker_page.py        # 查重清理页界面
+dedup_page.py          # 查重(关键字)页界面
 media_page.py          # 媒体索引页
 media_db.py            # 媒体库 SQLite 层
 media_scanner.py       # 媒体遍历与类型分类
 media_query.py         # CSV 导出
 photo_page.py          # 照片重命名页
+settings_page.py        # 设置页（哈希算法 / 线程数量）
 photo_rename.py        # 模板校验、命名生成、计划与执行
 photo_media.py         # EXIF / HEIC / 视频元数据提取
 config.py              # config.json 读写（四个页签的配置都存这里）
-fsops.py               # 移动/复制原语 + 长路径封装（四个页签共用）
 build.py               # 一键打包（读版本号、校验 CHANGELOG、保护 dist 里的运行数据）
 run_tests.py           # 回归测试（不启动界面，40 项核心逻辑检查）
 ```
@@ -98,7 +103,7 @@ run_tests.py           # 回归测试（不启动界面，40 项核心逻辑检�
 
 ## 版本约定
 
-版本号＝交付日期（`YYYYMMDD`），同日多次交付加 `a`/`b` 后缀。版本号只存在于 `file_toolkit.py` 的 `VER` 常量和窗口标题中，产物文件名不带版本号。
+版本号＝交付日期（`YYYYMMDD`），同日多次交付加 `a`/`b` 后缀。版本号只存在于 `common.py` 的 `VER` 常量和窗口标题中，产物文件名不带版本号。
 
 ## 贡献
 

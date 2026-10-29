@@ -8,7 +8,7 @@ import os
 import re
 
 import photo_media
-from fsops import transfer
+from util import transfer
 
 TEMPLATE_VARS = [
     ("{type}", "文件类型（IMG 照片 / VID 视频）"),
