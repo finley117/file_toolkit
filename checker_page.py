@@ -91,10 +91,12 @@ class CheckerPage(PageBase):
         self.var_out = tk.StringVar()
         ttk.Entry(bottom, textvariable=self.var_out).pack(side="left", fill="x", expand=True, padx=8)
         ttk.Button(bottom, text="选择…", width=8, command=self._pick_out).pack(side="left")
-        ttk.Button(bottom, text="全选", width=6,
-                   command=lambda: self._set_all(True)).pack(side="left", padx=(8, 0))
-        ttk.Button(bottom, text="全不选", width=7,
-                   command=lambda: self._set_all(False)).pack(side="left", padx=6)
+        self.btn_all = ttk.Button(bottom, text="全选", width=6,
+                                  command=lambda: self._set_all(True))
+        self.btn_all.pack(side="left", padx=(8, 0))
+        self.btn_none = ttk.Button(bottom, text="全不选", width=7,
+                                   command=lambda: self._set_all(False))
+        self.btn_none.pack(side="left", padx=6)
         self.btn_remove = ttk.Button(bottom, text="移除", width=8, style="Write.TButton",
                                      command=self._do_remove, state="disabled")
         self.btn_remove.pack(side="left")
@@ -109,6 +111,8 @@ class CheckerPage(PageBase):
         # 避免"扫的是 A 目录、校验却用新填的 B 目录"这种错配。
         self.scanned = None
         self._stats_text = ""
+        self._loading = False       # 分批插表中：禁用全选/全不选/移除
+        self._done_status = ""
         for var in (self.var_dir, self.var_extra, self.var_min, self.var_hidden, self.var_only):
             var.trace_add("write", self._on_param_change)
 
@@ -130,6 +134,12 @@ class CheckerPage(PageBase):
     def set_enabled(self, flag):
         self.btn_start.config(state="normal" if flag else "disabled")
         self.btn_stop.config(state="disabled")
+        state = "normal" if (flag and not self._loading) else "disabled"
+        for w in (self.btn_all, self.btn_none):
+            try:
+                w.config(state=state)
+            except Exception:
+                pass
         if not flag:
             self.btn_remove.config(state="disabled")
 
@@ -180,7 +190,8 @@ class CheckerPage(PageBase):
     def _refresh_remove_btn(self):
         same = (self.scanned is not None
                 and self._param_key(self._cur_params()) == self._param_key(self.scanned))
-        self.btn_remove.config(state="normal" if (self.groups and same) else "disabled")
+        enabled = self.groups and same and not self._loading and not self.app.busy
+        self.btn_remove.config(state="normal" if enabled else "disabled")
 
     def _on_param_change(self, *_):
         """参数被改动：结果保留（还能看），但「移除」失效并说明原因。"""
@@ -197,18 +208,18 @@ class CheckerPage(PageBase):
     def _start(self):
         base = self.var_dir.get().strip()
         extra = self.var_extra.get().strip()
-        if self.var_only.get() and not extra:
-            if not self.app.mb.askyesno(
-                    APP, "勾选了「仅比对额外目录」，但没有填写额外目录。\n\n"
-                         "是否改为「仅清理基础目录内部重复」（等同取消该勾选）？"):
-                return
-            self.var_only.set(False)
         if not base or not os.path.isdir(base):
             self.app.mb.showerror(APP, "请先选择有效的基础目录")
             return
         if is_drive_root(base):
             self.app.mb.showerror(APP, "暂不支持以盘根作为基础目录，请选择盘内的具体目录（整盘扫描请分段进行）")
             return
+        if self.var_only.get() and not extra:
+            if not self.app.mb.askyesno(
+                    APP, "勾选了「仅比对额外目录」，但没有填写额外目录。\n\n"
+                         "是否改为「仅清理基础目录内部重复」（等同取消该勾选）？"):
+                return
+            self.var_only.set(False)
         if extra:
             if not os.path.isdir(extra):
                 self.app.mb.showerror(APP, "额外目录无效")
@@ -230,6 +241,8 @@ class CheckerPage(PageBase):
         self._reset_sel()
         self.scanned = None
         self._stats_text = ""
+        self._render_token = getattr(self, "_render_token", 0) + 1   # 作废旧的分批插入
+        self._loading = False
         self.stats.config(text="")
         self.btn_remove.config(state="disabled")
         self.btn_stop.config(state="normal")
@@ -339,8 +352,13 @@ class CheckerPage(PageBase):
         mode = ("仅比对额外目录" if only_extra else
                 ("基础目录去重" if not has_extra else "全量去重"))
         self.app.progress_done()
-        self.app.set_status(f"完成{stopped}：基础 {self.n_base} 个 / 额外 {self.n_extra} 个文件，"
-                            f"耗时 {used:.1f}s，{mode}，算法 {self.app.var_algo.get()}")
+        status = (f"完成{stopped}：基础 {self.n_base} 个 / 额外 {self.n_extra} 个文件，"
+                  f"耗时 {used:.1f}s，{mode}，算法 {self.app.var_algo.get()}")
+        if not groups:
+            hint = "未发现基础目录与额外目录重复的文件" if has_extra else "未发现重复文件"
+            status = f"{hint}{stopped}"
+        self._done_status = status
+        self.app.set_status(status)
         self._log("[OK] 扫描完成%s：基础 %d / 额外 %d，重复 %d 组，待移除可回收 %s，耗时 %.1fs"
                   % (stopped, self.n_base, self.n_extra, len(groups), human_size(waste), used))
         if skip_txt:
@@ -353,23 +371,44 @@ class CheckerPage(PageBase):
         self.stats.config(text=self._stats_text)
         self.scanned = self._cur_params()      # 记住这组参数，之后改动会让「移除」失效
         self._refresh_remove_btn()
-        if not groups:
-            hint = "未发现基础目录与额外目录重复的文件" if has_extra else "未发现重复文件"
-            self.app.set_status(f"{hint}{stopped}")
+        self._set_loading(True)
         self._render_token = getattr(self, "_render_token", 0) + 1
         token = self._render_token
         self.tree.delete(*self.tree.get_children())
         self._insert_items(items, 0, token)
+
+    def _set_loading(self, flag):
+        """分批插表期间禁用全选/全不选/移除，插完再恢复。"""
+        self._loading = flag
+        if flag:
+            for w in (self.btn_all, self.btn_none, self.btn_remove):
+                w.config(state="disabled")
+            self.app.set_status("正在加载查重结果…")
+            return
+        state = "normal" if not self.app.busy else "disabled"
+        for w in (self.btn_all, self.btn_none):
+            w.config(state=state)
+        self._refresh_remove_btn()
+        self.app.set_status(self._done_status)
 
     def _insert_items(self, items, start, token):
         """分批插表，几万行也不会一次性卡死界面。"""
         if token != self._render_token:
             return
         end = min(start + 400, len(items))
-        for iid, values, tag in items[start:end]:
-            self.tree.insert("", "end", iid=iid, values=values, tags=(tag,))
+        try:
+            for iid, values, tag in items[start:end]:
+                self.tree.insert("", "end", iid=iid, values=values, tags=(tag,))
+        except Exception:
+            try:
+                self._set_loading(False)   # 别把全选/移除永久锁死
+            except Exception:
+                pass
+            raise
         if end < len(items):
             self.frame.after(1, lambda: self._insert_items(items, end, token))
+        else:
+            self._set_loading(False)
 
     def _default_out(self, base):
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -406,14 +445,14 @@ class CheckerPage(PageBase):
         self.tree.set(m["path"], "sel", "☑" if flag else "☐")
 
     def _set_all(self, flag):
-        if not self.groups:
+        if self._loading or not self.groups:
             return
         for gi, m in self._by_path.values():
             self._set_checked(gi, m, flag)
         self._update_stats()
 
     def _on_click(self, ev):
-        if self.app.busy:
+        if self.app.busy or self._loading:
             return
         if self.tree.identify_region(ev.x, ev.y) != "cell":
             return
@@ -435,6 +474,8 @@ class CheckerPage(PageBase):
         self.stats.config(text=self._stats_text)
 
     def _do_remove(self):
+        if self._loading:
+            return
         plan = checker_plan(self.groups)
         if not plan:
             self.app.mb.showinfo(APP, "没有勾选任何待移除文件")

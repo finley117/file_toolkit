@@ -37,6 +37,7 @@ class PhotoPage(PageBase):
                                         # 避免独立快照写回时把设置页的改动回滚到启动值（R-54）
         super().__init__(parent, app)
         self.result = None
+        self._plan_tpl = ""         # 本次分析使用的模板（执行确认时对照）
         self.stopped = False        # 分析被中断：结果不完整，不能执行
         self.applied = False        # 本次结果已用于执行（无论成败）：不能重复执行
         self._render_token = 0      # 表格分批插入的令牌：新一次刷新会作废旧批次
@@ -261,6 +262,7 @@ class PhotoPage(PageBase):
         self.app.progress_start("分析中…（只读）")
 
         cfg_tpl = self.var_tpl.get()
+        self._plan_tpl = cfg_tpl
         cfg_sub = bool(self.var_sub.get())
         cfg_basis = self.var_basis.get()
         cfg_alt = self.var_alt.get()
@@ -410,6 +412,11 @@ class PhotoPage(PageBase):
                % (len(ok_rows), skip_n))
         if excluded_n:
             msg += "已手动移除 %d 条，不会执行\n" % excluded_n
+        msg += "\n本次执行使用分析时的模板：%s\n" % (self._plan_tpl or "(空)")
+        cur_tpl = self.var_tpl.get().strip()
+        if cur_tpl != self._plan_tpl.strip():
+            msg += ("当前输入框模板已改为：%s\n"
+                    "如需按新模板执行，请重新分析。\n" % (cur_tpl or "(空)"))
         msg += ("\n⚠️ 执行依据是本次分析在内存里的结果，修改 plan.csv 不会影响执行。\n"
                 "计划报表（仅供核对）：%s\n\n确定继续？" % self.result["plan"])
         if not self.app.mb.askyesno("确认执行", msg, icon="warning"):

@@ -7,6 +7,10 @@ Windows 本地文件整理工具箱：按内容查重、按关键字归类、跨
 ![Python](https://img.shields.io/badge/Python-3.13-3776AB.svg)
 ![Platform](https://img.shields.io/badge/Platform-Windows-lightgrey.svg)
 
+## 开发与审核
+
+- 代码由 **DeepSeek** 完成；**GLM** 负责审核。
+
 ## 功能
 
 **查重清理** —— 按内容哈希找出完全相同的文件。大小预筛后只对候选文件计算哈希，支持

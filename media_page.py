@@ -376,7 +376,6 @@ class MediaPage(PageBase):
             messagebox.showerror('导出失败', '无法写入 CSV：\n%s' % e)
             return
         self.log_msg('已导出 %d 组到 %s' % (len(dups), path))
-        self.log_msg('已导出 CSV: %s' % path)
         messagebox.showinfo('导出完成', path)
 
     def do_dup(self):
