@@ -12,7 +12,11 @@ AUDIO_EXTS = {'mp3', 'wav', 'flac', 'aac', 'm4a', 'ogg', 'wma', 'ape', 'opus', '
 TYPE_MAP = {'photo': PHOTO_EXTS, 'video': VIDEO_EXTS, 'audio': AUDIO_EXTS}
 
 SKIP_DIRS = {'$recycle.bin', '$recycler', 'recycled',
-             'system volume information'}
+             'system volume information',
+             'windows', 'program files', 'program files (x86)',
+             'programdata', 'recovery', 'boot', 'efi', 'perflogs',
+             'config.msi', '$winreagent', '$sysreset', 'windows.old',
+             'msocache', 'documents and settings'}
 
 _ATTR_REPARSE = 0x400
 

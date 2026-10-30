@@ -17,13 +17,30 @@ import photo_rename
 from page_base import PageBase
 
 
+def _as_bool(value, default=True):
+    """配置里的布尔值：兼容 JSON bool 与手改成字符串的 "false"/"0"。"""
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("", "0", "false", "no", "off"):
+            return False
+        if text in ("1", "true", "yes", "on"):
+            return True
+        return default
+    return bool(value)
+
+
 class PhotoPage(PageBase):
     tag = "photo"
 
     def __init__(self, parent, app):
-        self.cfg = config.load()     # 要在 super 之前，_build_ui 会读
+        self.cfg = app.cfg             # 与 App 共用同一份配置字典（要在 super 之前，_build_ui 会读），
+                                        # 避免独立快照写回时把设置页的改动回滚到启动值（R-54）
         super().__init__(parent, app)
         self.result = None
+        self.stopped = False        # 分析被中断：结果不完整，不能执行
+        self.applied = False        # 本次结果已用于执行（无论成败）：不能重复执行
+        self._render_token = 0      # 表格分批插入的令牌：新一次刷新会作废旧批次
+        self._alt_before_basis = None   # 切到非拍摄日期前用户选的备选值
         self.cancel = threading.Event()
         self.excluded = set()        # 被用户手动移除的原文件名（全路径）
         self.show_only_ok = tk.BooleanVar(value=False)
@@ -42,7 +59,8 @@ class PhotoPage(PageBase):
         self.var_src = tk.StringVar(value=config.get_value(self.cfg, "photo.source_dir", ""))
         ttk.Entry(row1, textvariable=self.var_src).pack(side="left", fill="x", expand=True, padx=8)
         ttk.Button(row1, text="选择…", width=8, command=self._pick_src).pack(side="left")
-        self.var_sub = tk.BooleanVar(value=bool(config.get_value(self.cfg, "photo.include_subdir", True)))
+        self.var_sub = tk.BooleanVar(value=_as_bool(
+            config.get_value(self.cfg, "photo.include_subdir", True), True))
         ttk.Checkbutton(row1, text="包含子目录（只改文件，目录名不动）",
                         variable=self.var_sub).pack(side="left", padx=(10, 0))
 
@@ -142,11 +160,16 @@ class PhotoPage(PageBase):
         return ok
 
     def _on_basis_change(self, _ev=None):
-        """只有主基准是「拍摄日期」时，备选才有意义。"""
+        """只有主基准是「拍摄日期」时，备选才有意义；切回时恢复之前的选择。"""
         is_shoot = self.var_basis.get() == photo_media.DATE_BASIS_SHOOT
         self.cb_alt.configure(state="readonly" if is_shoot else "disabled")
         if not is_shoot:
+            if self._alt_before_basis is None:
+                self._alt_before_basis = self.var_alt.get()
             self.var_alt.set(photo_media.ALTERNATE_KEEP)
+        elif self._alt_before_basis:
+            self.var_alt.set(self._alt_before_basis)
+            self._alt_before_basis = None
 
     def _show_vars(self):
         lines = ["可用变量："] + ["  %-12s %s" % (k, d) for k, d in photo_rename.TEMPLATE_VARS]
@@ -184,8 +207,10 @@ class PhotoPage(PageBase):
                     pass
         else:
             has_rows = bool(self.result and self._visible_rows())
+            can_apply = (bool(self.result) and not self.stopped and not self.applied
+                         and any(r["状态"] == "ok" for r in self._visible_rows()))
             try:
-                self.btn_apply.config(state="normal" if self.result else "disabled")
+                self.btn_apply.config(state="normal" if can_apply else "disabled")
                 self.btn_open.config(state="normal" if self.result else "disabled")
                 self.btn_remove.config(state="normal" if has_rows else "disabled")
                 self.btn_stop.config(state="disabled")
@@ -225,6 +250,8 @@ class PhotoPage(PageBase):
             self._log("[!] 配置保存失败（程序目录不可写），本次设置不会被记住")
         self.tree.delete(*self.tree.get_children())
         self.result = None
+        self.stopped = False
+        self.applied = False
         self.excluded.clear()
         self.cancel.clear()
         self.btn_stop.config(state="normal")
@@ -246,6 +273,11 @@ class PhotoPage(PageBase):
 
         def work():
             try:
+                rd = photo_rename.report_dir_for(src)
+                try:
+                    os.makedirs(rd, exist_ok=True)
+                except OSError as e:
+                    raise RuntimeError("无法创建报告目录：%s" % e)
                 paths, skipped = photo_rename.collect_files(
                     src, cfg_sub, skip_extensions=cfg_skip,
                     on_log=lambda m: post(self.tag, "log", m))
@@ -255,11 +287,6 @@ class PhotoPage(PageBase):
                     on_progress=lambda d, t: post(self.tag, "prog", (d, t)),
                     on_log=lambda m: post(self.tag, "log", m),
                     cancel=self.cancel)
-                rd = photo_rename.report_dir_for(src)
-                try:
-                    os.makedirs(rd, exist_ok=True)
-                except OSError as e:
-                    raise RuntimeError("无法创建报告目录：%s" % e)
                 stopped = self.cancel.is_set()
                 name = ("plan_partial_%s.csv" % datetime.now().strftime("%Y%m%d_%H%M%S")
                         if stopped else "plan.csv")
@@ -272,19 +299,26 @@ class PhotoPage(PageBase):
             except Exception:
                 post(self.tag, "error", traceback.format_exc())
 
-        threading.Thread(target=work, daemon=True).start()
+        try:
+            threading.Thread(target=work, daemon=True).start()
+        except Exception as e:
+            self.app.release()
+            self.app.progress_done()
+            self._log("[x] 无法启动分析线程：%s" % e)
+            messagebox.showerror("错误", "无法启动分析线程：\n%s" % e)
 
     def _on_done(self, result):
         self.app.release()
         self.app.progress_done()
         self.btn_stop.config(state="disabled")
         self.result = result
+        self.stopped = bool(result.get("stopped"))
+        self.applied = False
         self.excluded.clear()
         self._refresh_table()
         ok_n = sum(1 for r in result["rows"] if r["状态"] == "ok")
         skip_n = len(result["rows"]) - ok_n
-        if result.get("stopped"):
-            self.btn_apply.config(state="disabled")
+        if self.stopped:
             self._log("[!] 分析已停止，结果不完整，未生成可执行计划；请重新分析")
             self.app.set_status("照片重命名：分析已停止（结果不完整），不能执行")
             return
@@ -307,21 +341,33 @@ class PhotoPage(PageBase):
 
     def _refresh_table(self):
         """重建表格。仅显示待重命名 开关与移除操作都走这里。"""
+        self._render_token += 1
+        token = self._render_token
         self.tree.delete(*self.tree.get_children())
         if not self.result:
             self.btn_remove.config(state="disabled")
             return
-        ok_n = 0
-        for i, r in enumerate(self._visible_rows()):
-            if r["状态"] == "ok":
-                ok_n += 1
+        rows = self._visible_rows()
+        ok_n = sum(1 for r in rows if r["状态"] == "ok")
+        can_apply = ok_n > 0 and not self.stopped and not self.applied
+        self.btn_apply.config(state="normal" if can_apply else "disabled")
+        self.btn_open.config(state="normal")
+        self.btn_remove.config(state="normal" if rows else "disabled")
+        self._insert_rows(rows, 0, token)
+
+    def _insert_rows(self, rows, start, token):
+        """分批插表，几万行也不会一次性卡死界面。"""
+        if token != self._render_token:
+            return
+        end = min(start + 300, len(rows))
+        for i in range(start, end):
+            r = rows[i]
             tag = "skip" if r["状态"] != "ok" else ("even" if i % 2 else "odd")
             self.tree.insert("", "end", tags=(tag,), values=(
                 r["序号"], r["所在目录"], r["原文件名"], r["新文件名"] or "-",
                 r["拍摄日期"], r["相机"], r["状态"], r["原因"]))
-        self.btn_apply.config(state="normal" if ok_n else "disabled")
-        self.btn_open.config(state="normal")
-        self.btn_remove.config(state="normal" if self._visible_rows() else "disabled")
+        if end < len(rows):
+            self.frame.after(1, lambda: self._insert_rows(rows, end, token))
 
     def _remove_selected(self):
         """把选中的行从本次计划中排除（不影响磁盘文件）。"""
@@ -350,7 +396,7 @@ class PhotoPage(PageBase):
     # ---------------------------------------------------------------- 执行
 
     def _on_apply(self):
-        if not self.result:
+        if not self.result or self.stopped or self.applied:
             return
         visible = self._visible_rows()
         ok_rows = [r for r in visible if r["状态"] == "ok"]
@@ -371,6 +417,8 @@ class PhotoPage(PageBase):
             return
         if not self.app.acquire(self):
             return
+        # 这份计划一旦用于执行（哪怕中途失败/停止）就不再复用，避免二次执行
+        self.applied = True
         self.cancel.clear()
         self.btn_stop.config(state="normal")
         self.app.progress_start("执行中…")
@@ -388,7 +436,13 @@ class PhotoPage(PageBase):
             except Exception:
                 post(self.tag, "error", traceback.format_exc())
 
-        threading.Thread(target=work, daemon=True).start()
+        try:
+            threading.Thread(target=work, daemon=True).start()
+        except Exception as e:
+            self.app.release()
+            self.app.progress_done()
+            self._log("[x] 无法启动执行线程：%s" % e)
+            messagebox.showerror("错误", "无法启动执行线程：\n%s" % e)
 
     def _on_applied(self, res):
         self.app.release()
@@ -401,3 +455,4 @@ class PhotoPage(PageBase):
             parts.append("未处理 %d" % res.get("skipped", 0))
         self.app.set_status("照片重命名完成：" + "，".join(parts))
         self._log("[i] 台账：%s" % res["manifest"])
+        self._log("[i] 这份计划已执行过，如需再次执行请重新分析")

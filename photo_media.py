@@ -2,7 +2,7 @@
 
 分派顺序按扩展名：
   JPEG/JPEG·exifread  → TIFF·exifread  → PNG·手写 eXIf 解析  → HEIC·pillow_heif+piexif
-  视频·ffprobe → ffmpeg → 纯 Python 解析 MP4/MOV 容器
+  视频·ffprobe → 纯 Python 解析 MP4/MOV 容器
 
 约定：
 - 所有函数都不抛异常，失败返回空字段 + warning，由上层决定是否排除该文件
@@ -11,7 +11,6 @@
 """
 
 import os
-import re
 import struct
 import subprocess
 from collections import OrderedDict
@@ -31,7 +30,7 @@ DATE_BASES = [DATE_BASIS_SHOOT, DATE_BASIS_MTIME, DATE_BASIS_CTIME]
 ALTERNATE_KEEP = "保留原文件名"
 ALTERNATE_DATES = [DATE_BASIS_MTIME, DATE_BASIS_CTIME, ALTERNATE_KEEP]
 
-_VIDEO_BACKEND = None  # None=未探测；"ffprobe"/"ffmpeg"/"py"
+_VIDEO_BACKEND = None  # None=未探测；"ffprobe"/"py"
 _VIDEO_LOCK = Lock()
 
 # MP4 纪元：1904-01-01 00:00:00 UTC 与 Unix 纪元之差
@@ -86,7 +85,7 @@ def empty_meta(warning=""):
 # ------------------------------------------------------------------ 工具函数
 
 def _base_dir():
-    """程序所在目录，用于查找外挂 ffmpeg/ffprobe。"""
+    """程序所在目录，用于查找外挂 ffprobe。"""
     import sys
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
@@ -101,8 +100,14 @@ def set_tool_path(name, path):
     """指定外部程序路径；传空字符串表示恢复自动查找。
 
     这是给"不想编译/不想放进 tools 目录"的人留的口子：界面上选一次，存进 config.json。
+    改 ffprobe 路径后要清掉后端探测缓存，否则当次分析仍会用旧的 "py"。
     """
-    _TOOL_OVERRIDE[name.replace(".exe", "").lower()] = (path or "").strip()
+    global _VIDEO_BACKEND
+    key = name.replace(".exe", "").lower()
+    _TOOL_OVERRIDE[key] = (path or "").strip()
+    if key == "ffprobe":
+        with _VIDEO_LOCK:
+            _VIDEO_BACKEND = None
 
 
 def _find_tool(name):
@@ -299,6 +304,14 @@ def _meta_from_png(path):
                 if len(head) < 8:
                     break
                 length, ctype = struct.unpack(">I4s", head)
+                if length > 1 << 20:
+                    if ctype == b"eXIf":
+                        meta["Warning"] = "PNG eXIf 块过大"
+                        return meta
+                    f.seek(length + 4, os.SEEK_CUR)
+                    if ctype == b"IEND":
+                        break
+                    continue
                 data = f.read(length)
                 f.read(4)  # CRC
                 if ctype == b"eXIf":
@@ -306,7 +319,7 @@ def _meta_from_png(path):
                     break
                 if ctype == b"IEND":
                     break
-    except OSError:
+    except (OSError, MemoryError):
         meta["Warning"] = "PNG 读取失败"
         return meta
     if blob is None:
@@ -416,20 +429,18 @@ def _meta_from_heic(path):
 # ------------------------------------------------------------------ 视频
 
 def detect_video_backend():
-    """探测视频元数据后端：ffprobe → ffmpeg → 纯 Python。结果缓存，多线程安全。"""
+    """探测视频元数据后端：ffprobe → 纯 Python。结果缓存，多线程安全。"""
     global _VIDEO_BACKEND
     if _VIDEO_BACKEND is not None:
         return _VIDEO_BACKEND
     with _VIDEO_LOCK:
         if _VIDEO_BACKEND is not None:
             return _VIDEO_BACKEND
-        for name, kind in (("ffprobe.exe", "ffprobe"), ("ffmpeg.exe", "ffmpeg")):
-            exe = _find_tool(name)
-            if not exe:
-                continue
+        exe = _find_tool("ffprobe.exe")
+        if exe:
             rc, _out, _err = _run_hidden([exe, "-version"], timeout=8)
             if rc == 0:
-                _VIDEO_BACKEND = kind
+                _VIDEO_BACKEND = "ffprobe"
                 return _VIDEO_BACKEND
         _VIDEO_BACKEND = "py"
         return _VIDEO_BACKEND
@@ -437,6 +448,9 @@ def detect_video_backend():
 
 def _meta_from_ffprobe(path, exe):
     meta = empty_meta()
+    if not exe:
+        meta["Warning"] = "ffprobe 不可用"
+        return meta
     rc, out, _err = _run_hidden([
         exe, "-v", "quiet", "-print_format", "json",
         "-show_entries", "format_tags=creation_time:stream_tags=creation_time",
@@ -470,45 +484,26 @@ def _meta_from_ffprobe(path, exe):
 
 
 def _parse_iso_time(text):
-    """解析 '2024-05-01T10:30:00.000000Z' 这类 UTC 时间串 → 本地时间。"""
+    """解析 '2024-05-01T10:30:00.000000Z' 这类时间串 → 本地时间（带时区时换算）。"""
     import datetime
     if not text:
         return None
-    text = str(text).strip()
-    for trim in (len(text), 19):
+    s = str(text).strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.datetime.fromisoformat(s)
+    except ValueError:
         try:
-            base = datetime.datetime.strptime(text[:trim], "%Y-%m-%dT%H:%M:%S")
+            dt = datetime.datetime.strptime(s[:19], "%Y-%m-%dT%H:%M:%S")
         except ValueError:
-            continue
-        if text.endswith("Z") or "+00:00" in text:
-            try:
-                return datetime.datetime.fromtimestamp(
-                    base.replace(tzinfo=datetime.timezone.utc).timestamp())
-            except (OSError, ValueError):
-                return base
-        return base
-    return None
-
-
-def _meta_from_ffmpeg(path, exe):
-    """ffmpeg -i 把元信息写到 stderr。"""
-    meta = empty_meta()
-    rc, _out, err = _run_hidden([exe, "-i", path])
-    if not err:
-        meta["Warning"] = "ffmpeg 无输出"
-        return meta
-    text = err.decode("utf-8", errors="ignore")
-    m = re.search(r"creation_time\s*:\s*(\S+)", text)
-    if not m:
-        meta["Warning"] = "ffmpeg 无 creation_time"
-        return meta
-    dt = _parse_iso_time(m.group(1))
-    if dt:
-        meta["DateTimeOriginal"] = dt
-        meta["Source"] = "ffmpeg"
-    else:
-        meta["Warning"] = "creation_time 解析失败"
-    return meta
+            return None
+    if dt.tzinfo is not None:
+        try:
+            return dt.astimezone().replace(tzinfo=None)
+        except (OSError, ValueError):
+            return dt.replace(tzinfo=None)
+    return dt
 
 
 def _meta_from_mp4(path):
@@ -584,12 +579,20 @@ def _read_mvhd(f, body, box_end):
 # ------------------------------------------------------------------ 入口
 
 def read_meta(path):
-    """按扩展名分派，返回 MediaMeta。永不抛异常。结果带 LRU 缓存。"""
-    cached = _META_CACHE.get(path)
+    """按扩展名分派，返回 MediaMeta。永不抛异常。结果带 LRU 缓存。
+
+    缓存键带上 mtime_ns + size：同名文件被替换后不会继续返回旧元数据。
+    """
+    try:
+        st = os.stat(path)
+        key = (os.path.normcase(path), st.st_mtime_ns, st.st_size)
+    except OSError:
+        key = (os.path.normcase(path), None, None)
+    cached = _META_CACHE.get(key)
     if cached is not None:
         return cached
     meta = _read_meta_uncached(path)
-    _META_CACHE.put(path, meta)
+    _META_CACHE.put(key, meta)
     return meta
 
 
@@ -610,8 +613,6 @@ def _read_meta_uncached(path):
         backend = detect_video_backend()
         if backend == "ffprobe":
             meta = _meta_from_ffprobe(path, _find_tool("ffprobe.exe"))
-        elif backend == "ffmpeg":
-            meta = _meta_from_ffmpeg(path, _find_tool("ffmpeg.exe"))
         else:
             meta = _meta_from_mp4(path)
         if meta["DateTimeOriginal"] is None and backend != "py":
@@ -655,9 +656,9 @@ def read_many(paths, workers=None, on_progress=None, cancel=None):
             if on_progress is not None:
                 on_progress(done, total)
     finally:
-        # 取消时丢弃还没开跑的任务，只等手上这几个跑完（最多 workers 个），
+        # 取消时丢弃还没开跑的任务，并等手上这几个跑完（最多 workers 个），
         # 而不是把整批都跑完——那是"点了停止却还在忙十几分钟"的原因。
-        ex.shutdown(wait=False, cancel_futures=True)
+        ex.shutdown(wait=True, cancel_futures=True)
     return results
 
 
@@ -668,7 +669,7 @@ def file_mtime(path):
     import datetime
     try:
         return datetime.datetime.fromtimestamp(os.path.getmtime(path)).replace(microsecond=0)
-    except OSError:
+    except (OSError, OverflowError, ValueError):
         return None
 
 
@@ -683,7 +684,7 @@ def file_ctime(path):
         st = os.stat(path)
         stamp = getattr(st, "st_birthtime", None) or st.st_ctime
         return datetime.datetime.fromtimestamp(stamp).replace(microsecond=0)
-    except OSError:
+    except (OSError, OverflowError, ValueError):
         return None
 
 

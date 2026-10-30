@@ -24,9 +24,9 @@ from util import (has_attr, human_size, is_drive_root, long_path, norm_path,
 
 
 APP = "File Toolkit"
-VER = "20261029"  # 版本号＝交付日期（同日多次交付加 a/b），每次交付改这一行
+VER = "20261030"  # 版本号＝交付日期（同日多次交付加 a/b），每次交付改这一行
 _CHUNK = 4 << 20
-_BENCH_MB = 32
+BENCH_MB = 32
 _ATTR_HIDDEN = 0x2
 _ATTR_SYSTEM = 0x4
 _ATTR_REPARSE = 0x400
@@ -323,11 +323,14 @@ def checker_execute(plan, dst, stop, on_progress, algo, only_extra):
                "groups": len(plan), "total": total, "stopped": stop.is_set()}
     manifest.append(f"结果：移动成功 {ok}，失败 {fail}，未尝试 {skipped}，副本 {copied}"
                     + ("（已中断）" if stop.is_set() else ""))
+    manifest_path = os.path.join(dst, "清单.txt")
     try:
-        with open(long_path(os.path.join(dst, "清单.txt")), "w", encoding="utf-8") as f:
+        with open(long_path(manifest_path), "w", encoding="utf-8") as f:
             f.write("\n".join(manifest) + "\n")
-    except OSError:
-        pass
+        summary["manifest"] = manifest_path
+    except OSError as e:
+        summary["manifest"] = None
+        summary["manifest_error"] = str(e)
     return summary
 
 
@@ -503,3 +506,15 @@ def benchmark_algo(algo):
     h.update(buf)
     dt = time.perf_counter() - t
     return len(buf) / dt / 1048576.0 if dt else 0.0
+
+
+def benchmark_all():
+    """用同一份内存数据依次测所有算法，返回 [(名字, MB/s), ...]（按 ALGOS 顺序）。
+
+    缓冲区由本模块持有，界面只负责画表——避免入口再复制一份 `_bench_buf`
+    导致 `benchmark_algo` 读到 None。
+    """
+    global _bench_buf
+    if _bench_buf is None:
+        _bench_buf = os.urandom(BENCH_MB * 1024 * 1024)
+    return [(name, benchmark_algo(name)) for name in ALGOS]

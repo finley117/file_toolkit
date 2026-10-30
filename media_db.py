@@ -4,7 +4,7 @@ import sys
 import sqlite3
 
 DEFAULT_RULE = r'([a-z]+)[\s\-@]*(\d+)'
-EXTRACT_VERSION = '3'
+EXTRACT_VERSION = '5'  # 关键字提取算法变更时递增，旧库会在下次打开时自动重建
 
 
 def _norm(word):
@@ -76,7 +76,14 @@ def init_db(c):
 
 def upsert_scan_path(c, custom_name, root_path):
     root_path = os.path.normpath(root_path)
-    c.execute('INSERT OR REPLACE INTO scan_paths(custom_name, root_path, scanned_at, file_count) '
+    row = c.execute('SELECT id FROM scan_paths WHERE root_path=?', (root_path,)).fetchone()
+    if row:
+        # 保留原 id：INSERT OR REPLACE 会删旧行再插新行，触发级联删除，
+        # 当前视图持有的 path_id 随即失效（误报“该路径已删除”）。
+        c.execute('UPDATE scan_paths SET custom_name=?, scanned_at=datetime("now") WHERE id=?',
+                  (custom_name, row[0]))
+        return row[0]
+    c.execute('INSERT INTO scan_paths(custom_name, root_path, scanned_at, file_count) '
               'VALUES(?,?,datetime("now"),0)', (custom_name, root_path))
     return c.execute('SELECT id FROM scan_paths WHERE root_path=?', (root_path,)).fetchone()[0]
 
@@ -120,16 +127,33 @@ def _clean_name(name):
     return name.rsplit('@', 1)[-1] if '@' in name else name
 
 
-def extract_keywords(name, prog):
-    name = _clean_name(name)
-    if prog is None:
-        return [_norm(name)]
+def _match_words(text, prog):
     words = []
-    for m in prog.findall(name):
+    for m in prog.findall(text):
         if isinstance(m, tuple):
             m = ''.join(m)
         if m:
-            words.append(_norm(m))
+            w = _norm(m)
+            if w:
+                words.append(w)
+    return words
+
+
+def extract_keywords(name, prog):
+    # name 已经是去掉扩展名的文件名（scanner 的 base / files.name 都是 stem），
+    # 这里不能再 splitext，否则 my.photo.jpg 会被切成 my
+    if prog is None:
+        w = _norm(name)
+        return [w] if w else []
+    words = _match_words(_clean_name(name), prog)
+    if not words and '@' in name:
+        # @ 后缀没匹配到：再用全名跑一次，救“关键词在 @ 前面”的文件。
+        # 后缀匹配成功时仍以 @ 后为准（song@live1 → LIVE1）。
+        words = _match_words(name, prog)
+    if not words:
+        # 规则匹配不到：回退 stem 原名，保证文件仍能被关键字检索到
+        w = _norm(name)
+        return [w] if w else []
     return words
 
 
@@ -229,32 +253,6 @@ def delete_file_by_path(c, full_path):
     return True
 
 
-def prune_missing_path(c, path_id):
-    row = c.execute('SELECT root_path FROM scan_paths WHERE id=?', (path_id,)).fetchone()
-    if not row or not os.path.isdir(row[0]):
-        return None
-    files = c.execute('SELECT id, full_path FROM files WHERE path_id=?', (path_id,)).fetchall()
-    gone = [fid for fid, fp in files if not os.path.exists(fp)]
-    if gone:
-        c.executemany('DELETE FROM files WHERE id=?', [(i,) for i in gone])
-        _cleanup_orphan_keywords(c)
-    _refresh_count(c, path_id)
-    c.commit()
-    return len(gone)
-
-
-def prune_missing(c):
-    total = 0
-    skipped = 0
-    for (pid,) in c.execute('SELECT id FROM scan_paths').fetchall():
-        n = prune_missing_path(c, pid)
-        if n is None:
-            skipped += 1
-        else:
-            total += n
-    return total, skipped
-
-
 def get_rule(c):
     row = c.execute('SELECT keyword_rule FROM settings WHERE id=1').fetchone()
     return row[0].strip() if row and row[0] and row[0].strip() else DEFAULT_RULE
@@ -313,25 +311,47 @@ def rename_keyword(c, old_word, new_word):
     return True
 
 
-def apply_rule_to_keywords(c, rule):
+def apply_rule_to_keywords(c, rule, on_progress=None, cancel=None):
     files = c.execute('SELECT id, name FROM files').fetchall()
+    total = len(files)
     prog = _compile_rule(rule)
+    if cancel is not None and cancel.is_set():
+        return False
     c.execute('DELETE FROM file_keywords')
-    for fid, name in files:
-        for w in dict.fromkeys(extract_keywords(name, prog)):
-            c.execute('INSERT OR IGNORE INTO keywords(word) VALUES(?)', (w,))
-            kid = c.execute('SELECT id FROM keywords WHERE word=?', (w,)).fetchone()[0]
-            c.execute('INSERT OR IGNORE INTO file_keywords(file_id, keyword_id) VALUES(?,?)', (fid, kid))
-    for (fid,) in c.execute('SELECT DISTINCT file_id FROM manual_keywords').fetchall():
-        c.execute('DELETE FROM file_keywords WHERE file_id=?', (fid,))
-        for (w,) in c.execute('SELECT word FROM manual_keywords WHERE file_id=?', (fid,)).fetchall():
-            w = _norm(w)
-            c.execute('INSERT OR IGNORE INTO keywords(word) VALUES(?)', (w,))
-            kid = c.execute('SELECT id FROM keywords WHERE word=?', (w,)).fetchone()[0]
-            c.execute('INSERT OR IGNORE INTO file_keywords(file_id, keyword_id) VALUES(?,?)', (fid, kid))
-    c.execute('DELETE FROM keywords WHERE id NOT IN (SELECT keyword_id FROM file_keywords)')
-    c.execute('UPDATE settings SET applied_rule=? WHERE id=1', (_signature(rule),))
-    c.commit()
+    try:
+        for i, (fid, name) in enumerate(files, 1):
+            if cancel is not None and i % 200 == 0 and cancel.is_set():
+                c.rollback()
+                return False
+            for w in dict.fromkeys(extract_keywords(name, prog)):
+                c.execute('INSERT OR IGNORE INTO keywords(word) VALUES(?)', (w,))
+                kid = c.execute('SELECT id FROM keywords WHERE word=?', (w,)).fetchone()[0]
+                c.execute('INSERT OR IGNORE INTO file_keywords(file_id, keyword_id) VALUES(?,?)', (fid, kid))
+            if on_progress is not None and (i % 200 == 0 or i == total):
+                on_progress(i, total)
+        manual = c.execute('SELECT DISTINCT file_id FROM manual_keywords').fetchall()
+        for j, (fid,) in enumerate(manual, 1):
+            if cancel is not None and j % 200 == 0 and cancel.is_set():
+                c.rollback()
+                return False
+            c.execute('DELETE FROM file_keywords WHERE file_id=?', (fid,))
+            for (w,) in c.execute('SELECT word FROM manual_keywords WHERE file_id=?', (fid,)).fetchall():
+                w = _norm(w)
+                c.execute('INSERT OR IGNORE INTO keywords(word) VALUES(?)', (w,))
+                kid = c.execute('SELECT id FROM keywords WHERE word=?', (w,)).fetchone()[0]
+                c.execute('INSERT OR IGNORE INTO file_keywords(file_id, keyword_id) VALUES(?,?)', (fid, kid))
+        if cancel is not None and cancel.is_set():
+            c.rollback()
+            return False
+        c.execute('DELETE FROM keywords WHERE id NOT IN (SELECT keyword_id FROM file_keywords)')
+        c.execute('UPDATE settings SET applied_rule=? WHERE id=1', (_signature(rule),))
+        c.commit()
+    except Exception:
+        c.rollback()
+        raise
+    if on_progress is not None and total == 0:
+        on_progress(0, 0)
+    return True
 
 
 def rename_file_to_keyword(c, old_path, new_path, word):
@@ -353,16 +373,24 @@ def rename_file_to_keyword(c, old_path, new_path, word):
 
 
 def rename_folder(c, old_dir, new_dir):
+    """目录改名后同步库内路径，返回无法更新的索引根数量（UNIQUE 冲突）。"""
     old_dir = old_dir.rstrip('\\/')
     old_prefix = old_dir + os.sep
     for fid, fp in c.execute('SELECT id, full_path FROM files').fetchall():
         if fp.startswith(old_prefix):
             c.execute('UPDATE files SET full_path=? WHERE id=?',
                       (new_dir + fp[len(old_dir):], fid))
+    conflicts = 0
     for pid, rp in c.execute('SELECT id, root_path FROM scan_paths').fetchall():
         if rp == old_dir:
-            c.execute('UPDATE scan_paths SET root_path=? WHERE id=?', (new_dir, pid))
+            new_root = new_dir
         elif rp.startswith(old_prefix):
-            c.execute('UPDATE scan_paths SET root_path=? WHERE id=?',
-                      (new_dir + rp[len(old_dir):], pid))
+            new_root = new_dir + rp[len(old_dir):]
+        else:
+            continue
+        try:
+            c.execute('UPDATE scan_paths SET root_path=? WHERE id=?', (new_root, pid))
+        except sqlite3.IntegrityError:
+            conflicts += 1
     c.commit()
+    return conflicts

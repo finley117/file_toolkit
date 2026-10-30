@@ -3,6 +3,7 @@ import os
 import re
 import subprocess
 import threading
+import time
 import traceback
 import tkinter as tk
 from datetime import datetime
@@ -12,7 +13,7 @@ import media_db as db
 import media_query
 import media_scanner as scanner
 from page_base import PageBase
-from util import transfer
+from util import long_path, paths_overlap, transfer
 
 
 class MediaPage(PageBase):
@@ -23,11 +24,13 @@ class MediaPage(PageBase):
         super().__init__(parent, app)
         self.scan_cancel = None
         self.scan_thread = None
+        self.rule_cancel = threading.Event()
         self.dups = []
         self.current_rows = []
         self.path_map = {}
         self.view = None
         self.expand_rows = False
+        self._last_prog = 0.0
         c = db.conn()
         db.init_db(c)
         normalized = db.normalize_paths(c) if db.needs_path_normalize(c) else 0
@@ -66,9 +69,6 @@ class MediaPage(PageBase):
         self.btn_rename_dirs = ttk.Button(frm, text='重命名文件夹', style='Write.TButton',
                                           command=self.rename_folders, state='disabled')
         self.btn_rename_dirs.pack(side='left', padx=2)
-        self.btn_prune = ttk.Button(frm, text='清理失效', style='Write.TButton',
-                                    command=self.prune_all)
-        self.btn_prune.pack(side='left', padx=2)
         ttk.Label(frm, text='关键字正则:').pack(side='left', padx=(15, 2))
         self.rule_entry = ttk.Entry(frm, width=22)
         self.rule_entry.pack(side='left')
@@ -132,7 +132,35 @@ class MediaPage(PageBase):
         self.log.pack(fill='x', padx=10, pady=(6, 10))
 
     def log_msg(self, msg):
-        self.root.after(0, lambda: (self.log.insert('end', msg + '\n'), self.log.see('end')))
+        self.app.post(self.tag, 'log', msg)
+
+    def _write_log(self, msg):
+        try:
+            if not self.log.winfo_exists():
+                return
+            self.log.insert('end', msg + '\n')
+            lines = int(self.log.index('end-1c').split('.')[0])
+            if lines > 2000:
+                self.log.delete('1.0', '%d.0' % (lines - 2000 + 1))
+            self.log.see('end')
+        except tk.TclError:
+            pass
+
+    def handle(self, kind, payload):
+        if kind == 'log':
+            self._write_log(payload)
+        elif kind == 'prog':
+            path, count = payload
+            self.status.config(text='扫描中... %d 个文件 | %s' % (count, path))
+        elif kind == 'scan_done':
+            self._finish_scan(*payload)
+        elif kind == 'scan_failed':
+            self._scan_failed(payload)
+        elif kind == 'rule_prog':
+            done, total = payload
+            self.app.progress_det(done, total, '重建关键字 %d/%d' % (done, total))
+        elif kind == 'rule_done':
+            self._rule_done(payload)
 
     def _refresh_paths(self):
         c = db.conn()
@@ -154,10 +182,25 @@ class MediaPage(PageBase):
         self.status.config(text='总文件: %d | 总关键字: %d | DB: %s' % (fc, kc, db.db_path()))
 
     def add_path(self):
+        if self._busy_guard():
+            return
         d = filedialog.askdirectory(title='选择磁盘或目录')
         if not d:
             return
         d = os.path.normpath(d)
+        c = db.conn()
+        try:
+            existing = [row[2] for row in db.list_paths(c)]
+        finally:
+            c.close()
+        for root in existing:
+            if paths_overlap(d, root):
+                if not messagebox.askyesno(
+                        '路径重叠',
+                        '该路径与已索引路径重叠：\n%s\n\n'
+                        '同一文件可能被索引两次。仍然继续？' % root):
+                    return
+                break
         name = simpledialog.askstring('设备名称', '为该路径设置自定义名称(留空则使用路径本身):')
         if name is None:
             return
@@ -169,25 +212,42 @@ class MediaPage(PageBase):
         if self.scan_thread and self.scan_thread.is_alive():
             messagebox.showinfo('提示', '正在扫描中, 请稍候')
             return False
+        kinds = {k for k, v in self.var_kinds.items() if v.get()}
+        if not kinds:
+            messagebox.showinfo('提示', '请至少勾选一种媒体类型（照片 / 视频 / 音频）')
+            return False
         if not self.app.acquire(self):
             return False
-        kinds = {k for k, v in self.var_kinds.items() if v.get()} or {'video'}
         cancel = threading.Event()
         self.scan_cancel = cancel
-        self.btn_stop.config(state='normal')
+        self.btn_stop.config(text='停止扫描', state='normal')
         self.progress.pack(side='right')
         self.progress.start()
         t = threading.Thread(target=self._scan_worker, args=(root, custom, kinds, cancel),
                              daemon=True)
-        t.start()
+        try:
+            t.start()
+        except Exception as e:
+            self.app.release()
+            self.progress.stop()
+            self.progress.pack_forget()
+            self.btn_stop.config(state='disabled')
+            messagebox.showerror('扫描失败', '无法启动扫描线程：\n%s' % e)
+            return False
         self.scan_thread = t
         return True
 
     def stop_scan(self):
-        if self.scan_cancel is not None and not self.scan_cancel.is_set():
-            self.scan_cancel.set()
+        if self.scan_thread and self.scan_thread.is_alive():
+            if self.scan_cancel is not None and not self.scan_cancel.is_set():
+                self.scan_cancel.set()
+                self.btn_stop.config(state='disabled')
+                self.status.config(text='正在停止扫描…')
+            return
+        if self.app.owner is self and not self.rule_cancel.is_set():
+            self.rule_cancel.set()
             self.btn_stop.config(state='disabled')
-            self.status.config(text='正在停止扫描…')
+            self.status.config(text='正在停止重建…')
 
     def _scan_worker(self, root, custom, kinds, cancel):
         c = None
@@ -195,16 +255,16 @@ class MediaPage(PageBase):
             files, _ = scanner.scan(root, kinds, progress_cb=self._prog,
                                     cancel_cb=cancel.is_set)
             if cancel.is_set():
-                self.root.after(0, self._finish_scan, root, 0, True)
+                self.app.post(self.tag, 'scan_done', (root, 0, True))
                 return
             c = db.conn()
             pid = db.upsert_scan_path(c, custom, root)
             db.clear_path_files(c, pid)
             db.insert_files(c, pid, files)
             c.commit()
-            self.root.after(0, self._finish_scan, root, len(files), False)
+            self.app.post(self.tag, 'scan_done', (root, len(files), False))
         except Exception:
-            self.root.after(0, self._scan_failed, traceback.format_exc())
+            self.app.post(self.tag, 'scan_failed', traceback.format_exc())
         finally:
             if c is not None:
                 try:
@@ -218,11 +278,15 @@ class MediaPage(PageBase):
         self.progress.pack_forget()
         self.btn_stop.config(state='disabled')
         self.status.config(text='扫描失败')
-        self.log_msg('[x] ' + tb.strip().splitlines()[-1])
+        self._write_log('[x] ' + tb.strip().splitlines()[-1])
         messagebox.showerror('扫描失败', tb)
 
     def _prog(self, path, count):
-        self.root.after(0, lambda: self.status.config(text='扫描中... %d 个文件 | %s' % (count, path)))
+        now = time.monotonic()
+        if now - self._last_prog < 0.1 and count % 200 != 0:
+            return
+        self._last_prog = now
+        self.app.post(self.tag, 'prog', (path, count))
 
     def _finish_scan(self, root, n, cancelled):
         self.app.release()
@@ -230,14 +294,16 @@ class MediaPage(PageBase):
         self.progress.pack_forget()
         self.btn_stop.config(state='disabled')
         if cancelled:
-            self.log_msg('扫描已取消: %s (索引未变更)' % root)
+            self._write_log('扫描已取消: %s (索引未变更)' % root)
             self.status.config(text='扫描已取消')
         else:
-            self.log_msg('扫描完成 %s: %d 个媒体文件' % (root, n))
+            self._write_log('扫描完成 %s: %d 个媒体文件' % (root, n))
         self._refresh_paths()
         self._reload_view()
 
     def rename_path(self):
+        if self._busy_guard():
+            return
         sel = self.path_list.curselection()
         if not sel:
             messagebox.showinfo('提示', '请先在左侧选择一个路径')
@@ -265,6 +331,8 @@ class MediaPage(PageBase):
             self._reload_view()
 
     def del_path(self):
+        if self._busy_guard():
+            return
         sel = self.path_list.curselection()
         if not sel:
             messagebox.showinfo('提示', '请先在左侧选择一个路径')
@@ -302,7 +370,12 @@ class MediaPage(PageBase):
                                             initialfile='keyword_dups.csv')
         if not path:
             return
-        media_query.export_csv(path, dups)
+        try:
+            media_query.export_csv(path, dups)
+        except Exception as e:
+            messagebox.showerror('导出失败', '无法写入 CSV：\n%s' % e)
+            return
+        self.log_msg('已导出 %d 组到 %s' % (len(dups), path))
         self.log_msg('已导出 CSV: %s' % path)
         messagebox.showinfo('导出完成', path)
 
@@ -375,7 +448,13 @@ class MediaPage(PageBase):
 
     @staticmethod
     def _valid_name(name):
-        return bool(name) and not any(ch in name for ch in '<>:"/\\|?*')
+        if not name or name in ('.', '..'):
+            return False
+        if any(ch in name for ch in '<>:"/\\|?*'):
+            return False
+        if name != name.rstrip(' .'):
+            return False
+        return not re.match(r'^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$', name, re.I)
 
     @staticmethod
     def _is_root(path):
@@ -433,10 +512,11 @@ class MediaPage(PageBase):
         c = db.conn()
         renamed = skipped = failed = 0
         records = []
+        abort = None
         try:
             for fp, target, word in todo:
                 stamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                if os.path.exists(target):
+                if os.path.exists(long_path(target)):
                     skipped += 1
                     records.append([stamp, '重命名文件', fp, target, word, '跳过', '目标已存在'])
                     self.log_msg('跳过(目标已存在): ' + target)
@@ -447,9 +527,20 @@ class MediaPage(PageBase):
                     records.append([stamp, '重命名文件', fp, target, word, '失败', why])
                     self.log_msg('重命名失败: %s (%s)' % (fp, why))
                     continue
-                db.rename_file_to_keyword(c, fp, target, word)
+                try:
+                    updated = db.rename_file_to_keyword(c, fp, target, word)
+                except Exception as e:
+                    failed += 1
+                    records.append([stamp, '重命名文件', fp, target, word, '失败',
+                                    '磁盘已改名，库更新失败：%s' % e])
+                    self.log_msg('改名成功但库更新失败: %s (%s)' % (fp, e))
+                    continue
                 renamed += 1
-                records.append([stamp, '重命名文件', fp, target, word, '成功', ''])
+                records.append([stamp, '重命名文件', fp, target, word, '成功',
+                                '' if updated else '库中未找到该文件'])
+        except Exception as e:
+            abort = e
+            self.log_msg('[!] 重命名中断：%s' % e)
         finally:
             c.close()
         ledger = self._write_ledger('重命名文件', records)
@@ -457,6 +548,9 @@ class MediaPage(PageBase):
             renamed, skipped, failed, ambiguous,
             ('，台账: %s' % ledger) if ledger else ''))
         self._reload_view()
+        if abort is not None:
+            messagebox.showwarning('重命名中断', '已中断：%s\n已完成 %d 条，明细见台账%s'
+                                   % (abort, renamed, ('：' + ledger) if ledger else ''))
 
     def rename_folders(self):
         if self._busy_guard():
@@ -516,10 +610,11 @@ class MediaPage(PageBase):
         c = db.conn()
         renamed = failed = 0
         records = []
+        abort = None
         try:
             for d, target in sorted(todo, key=lambda x: x[0].count(os.sep), reverse=True):
                 stamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                if os.path.exists(target):
+                if os.path.exists(long_path(target)):
                     skipped += 1
                     records.append([stamp, '重命名文件夹', d, target, '', '跳过', '目标已存在'])
                     self.log_msg('跳过(目标已存在): ' + target)
@@ -530,9 +625,23 @@ class MediaPage(PageBase):
                     records.append([stamp, '重命名文件夹', d, target, '', '失败', why])
                     self.log_msg('文件夹重命名失败: %s (%s)' % (d, why))
                     continue
-                db.rename_folder(c, d, target)
+                try:
+                    conflicts = db.rename_folder(c, d, target)
+                except Exception as e:
+                    failed += 1
+                    records.append([stamp, '重命名文件夹', d, target, '', '失败',
+                                    '磁盘已改名，库更新失败：%s' % e])
+                    self.log_msg('改名成功但库更新失败: %s (%s)' % (d, e))
+                    continue
                 renamed += 1
-                records.append([stamp, '重命名文件夹', d, target, '', '成功', ''])
+                note = ('索引根冲突 %d 条未更新' % conflicts) if conflicts else ''
+                records.append([stamp, '重命名文件夹', d, target, '', '成功', note])
+                if conflicts:
+                    self.log_msg('文件夹已改名，但有 %d 条索引根路径冲突未更新: %s'
+                                 % (conflicts, target))
+        except Exception as e:
+            abort = e
+            self.log_msg('[!] 文件夹重命名中断：%s' % e)
         finally:
             c.close()
         ledger = self._write_ledger('重命名文件夹', records)
@@ -540,6 +649,9 @@ class MediaPage(PageBase):
             renamed, skipped, failed, ('，台账: %s' % ledger) if ledger else ''))
         self._refresh_paths()
         self._reload_view()
+        if abort is not None:
+            messagebox.showwarning('重命名中断', '已中断：%s\n已完成 %d 条，明细见台账%s'
+                                   % (abort, renamed, ('：' + ledger) if ledger else ''))
 
     def on_path_double(self, ev):
         self.show_path_keywords(False)
@@ -559,36 +671,17 @@ class MediaPage(PageBase):
             '(展开全部)' if expand else '', label, len(self.current_rows)))
 
     def rescan_path(self, pid, custom, root):
+        if self._busy_guard():
+            return
         if not os.path.isdir(root):
             messagebox.showinfo('提示', '路径当前不可访问(磁盘可能已拔出):\n%s' % root)
             return
         if self._start_scan(root, custom or root):
             self.log_msg('开始更新关键字(重扫描): %s' % root)
 
-    def prune_path(self, pid, label):
-        c = db.conn()
-        n = db.prune_missing_path(c, pid)
-        c.close()
-        if n is None:
-            messagebox.showinfo('提示', '路径当前不可访问, 已跳过:\n%s' % label)
-            return
-        self.log_msg('已清理失效记录: %s (删除 %d 条)' % (label, n))
-        self._refresh_paths()
-        self._reload_view()
-
-    def prune_all(self):
+    def on_path_right_click(self, ev):
         if self._busy_guard():
             return
-        c = db.conn()
-        removed, skipped = db.prune_missing(c)
-        c.close()
-        self.log_msg('清理失效记录: 删除 %d 条, 跳过 %d 个不可访问路径' % (removed, skipped))
-        self._refresh_paths()
-        self._reload_view()
-        messagebox.showinfo('清理完成',
-                            '删除 %d 条失效记录\n跳过 %d 个不可访问路径' % (removed, skipped))
-
-    def on_path_right_click(self, ev):
         if self.path_list.size() == 0:
             return
         idx = self.path_list.nearest(ev.y)
@@ -606,7 +699,6 @@ class MediaPage(PageBase):
                          command=lambda: self.show_path_keywords(True))
         menu.add_command(label='更新关键字(重扫描)',
                          command=lambda: self.rescan_path(pid, custom, root))
-        menu.add_command(label='清理失效记录', command=lambda: self.prune_path(pid, label))
         menu.add_separator()
         menu.add_command(label='重命名', command=self.rename_path)
         menu.add_command(label='删除路径', command=self.del_path)
@@ -632,7 +724,7 @@ class MediaPage(PageBase):
 
     def open_location(self, path):
         p = os.path.normpath(path)
-        if not os.path.exists(p):
+        if not os.path.exists(long_path(p)):
             res = messagebox.askyesnocancel(
                 '路径不可用',
                 '路径不存在或磁盘可能已拔出:\n%s\n\n'
@@ -651,7 +743,11 @@ class MediaPage(PageBase):
             else:
                 self._copy(p)
             return
-        subprocess.Popen(['explorer', '/select,', p])
+        try:
+            subprocess.Popen(['explorer', '/select,', p])
+        except Exception as e:
+            messagebox.showerror('打开失败', '无法打开所在文件夹：\n%s' % e)
+            return
         self.log_msg('已打开所在文件夹: ' + p)
 
     def on_double(self, ev):
@@ -715,8 +811,17 @@ class MediaPage(PageBase):
         if self.app.busy or not self.app.acquire(self):
             self.log_msg('当前有任务在运行, 规则未自动重建, 请稍后手动点击「应用规则」')
             return
+        self.rule_cancel.clear()
+        self.app.progress_start('重建关键字…')
+        self.btn_stop.config(text='停止重建', state='normal')
         self.log_msg('开始后台重建关键字...')
-        threading.Thread(target=self._apply_worker, args=(rule,), daemon=True).start()
+        try:
+            threading.Thread(target=self._apply_worker, args=(rule,), daemon=True).start()
+        except Exception as e:
+            self._release_rule()
+            self.app.progress_done()
+            self.btn_stop.config(text='停止扫描', state='disabled')
+            self.log_msg('无法启动重建线程: %s' % e)
 
     def apply_rule(self):
         rule = self.rule_entry.get().strip()
@@ -740,15 +845,27 @@ class MediaPage(PageBase):
             self._release_rule()
             messagebox.showerror('错误', '保存规则失败:\n%s' % e)
             return
+        self.rule_cancel.clear()
+        self.app.progress_start('重建关键字…')
+        self.btn_stop.config(text='停止重建', state='normal')
         self.log_msg('正在应用关键字规则: %r' % rule)
-        threading.Thread(target=self._apply_worker, args=(rule,), daemon=True).start()
+        try:
+            threading.Thread(target=self._apply_worker, args=(rule,), daemon=True).start()
+        except Exception as e:
+            self._release_rule()
+            self.app.progress_done()
+            self.btn_stop.config(text='停止扫描', state='disabled')
+            messagebox.showerror('错误', '无法启动重建线程:\n%s' % e)
 
     def _apply_worker(self, rule):
         c = None
         try:
             c = db.conn()
-            db.apply_rule_to_keywords(c, rule)
-            msg = '规则应用完成, 已重建关键字'
+            ok = db.apply_rule_to_keywords(
+                c, rule,
+                on_progress=lambda d, t: self.app.post(self.tag, 'rule_prog', (d, t)),
+                cancel=self.rule_cancel)
+            msg = '规则应用完成, 已重建关键字' if ok else '重建已取消, 关键字未改变'
         except re.error as e:
             msg = '正则错误: %s' % e
         except Exception as e:
@@ -759,8 +876,15 @@ class MediaPage(PageBase):
                     c.close()
                 except Exception:
                     pass
-        self.root.after(0, lambda: (self._release_rule(), self._update_status(),
-                                    self._reload_view(), self.log_msg(msg)))
+        self.app.post(self.tag, 'rule_done', msg)
+
+    def _rule_done(self, msg):
+        self._release_rule()
+        self.app.progress_done()
+        self.btn_stop.config(text='停止扫描', state='disabled')
+        self._update_status()
+        self._reload_view()
+        self._write_log(msg)
 
     def _release_rule(self):
         if self.app.owner is self:
@@ -775,20 +899,23 @@ class MediaPage(PageBase):
             except Exception:
                 pass
         try:
+            self.path_list.config(state=state)
+        except Exception:
+            pass
+        try:
             if flag:
                 self._update_action_buttons()   # 重命名按钮按"是否选中路径"恢复
             else:
                 self.btn_rename_files.config(state='disabled')
                 self.btn_rename_dirs.config(state='disabled')
-                self.btn_prune.config(state='disabled')
                 self.btn_stop.config(state='disabled')
         except Exception:
             pass
 
     def _busy_guard(self):
-        """写盘类操作的统一闸门：别的页签在跑任务时直接拦住。"""
+        """写盘类操作的统一闸门：有任务在跑时直接拦住。"""
         if self.app.busy:
-            messagebox.showinfo('提示', '另一个任务正在运行，等它结束后再操作')
+            messagebox.showinfo('提示', '当前有任务正在运行，等它结束后再操作')
             return True
         return False
 

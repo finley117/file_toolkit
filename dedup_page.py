@@ -125,7 +125,7 @@ class DedupPage(PageBase):
         except re.error as e:
             self.lbl_rule.config(text="正则无效：%s" % e, foreground="#A32D2D")
             return False
-        self.lbl_rule.config(text="自定义正则：取第一个匹配，多分组按顺序拼接，结果转小写",
+        self.lbl_rule.config(text="自定义正则：取第一个匹配，多分组按顺序拼接，结果转大写",
                              foreground="#0F6E56")
         return True
 
@@ -139,8 +139,10 @@ class DedupPage(PageBase):
             var.set(os.path.normpath(d))
             if var is self.var_src:
                 b = os.path.normpath(d)
-                self.var_dst.set(b + "_sorted")
-                self.var_quar.set(b + "_dup_hash")
+                if not self.var_dst.get().strip():
+                    self.var_dst.set(b + "_sorted")
+                if not self.var_quar.get().strip():
+                    self.var_quar.set(b + "_dup_hash")
 
     def _log(self, msg):
         self.log.configure(state="normal")
@@ -235,7 +237,13 @@ class DedupPage(PageBase):
             except Exception:
                 post(self.tag, "error", traceback.format_exc())
 
-        threading.Thread(target=work, daemon=True).start()
+        try:
+            threading.Thread(target=work, daemon=True).start()
+        except Exception as e:
+            self.app.release()
+            self.app.progress_done()
+            self._log("[x] 无法启动分析线程：%s" % e)
+            self.app.mb.showerror(APP, "无法启动分析线程：\n%s" % e)
 
     def _confirm(self, r):
         if r.get("stopped"):
@@ -279,7 +287,13 @@ class DedupPage(PageBase):
             except Exception:
                 post(self.tag, "error", traceback.format_exc())
 
-        threading.Thread(target=work, daemon=True).start()
+        try:
+            threading.Thread(target=work, daemon=True).start()
+        except Exception as e:
+            self.app.release()
+            self.app.progress_done()
+            self._log("[x] 无法启动执行线程：%s" % e)
+            self.app.mb.showerror(APP, "无法启动执行线程：\n%s" % e)
 
     def _on_stop(self):
         if self.app.busy:

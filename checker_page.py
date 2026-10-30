@@ -129,6 +129,7 @@ class CheckerPage(PageBase):
 
     def set_enabled(self, flag):
         self.btn_start.config(state="normal" if flag else "disabled")
+        self.btn_stop.config(state="disabled")
         if not flag:
             self.btn_remove.config(state="disabled")
 
@@ -196,6 +197,12 @@ class CheckerPage(PageBase):
     def _start(self):
         base = self.var_dir.get().strip()
         extra = self.var_extra.get().strip()
+        if self.var_only.get() and not extra:
+            if not self.app.mb.askyesno(
+                    APP, "勾选了「仅比对额外目录」，但没有填写额外目录。\n\n"
+                         "是否改为「仅清理基础目录内部重复」（等同取消该勾选）？"):
+                return
+            self.var_only.set(False)
         if not base or not os.path.isdir(base):
             self.app.mb.showerror(APP, "请先选择有效的基础目录")
             return
@@ -242,12 +249,13 @@ class CheckerPage(PageBase):
                 base_abs = os.path.abspath(base)
                 rows, skipped = scan_tree(base_abs, min_bytes, hidden, stop, SRC_BASE,
                                           lambda n: post(self.tag, "scan", ("基础", n)))
-                self.n_base = len(rows)
+                n_base = len(rows)
+                n_extra = 0
                 if extra and not stop.is_set():
                     more, sk2 = scan_tree(os.path.abspath(extra), min_bytes, hidden, stop,
                                           SRC_EXTRA,
-                                          lambda n: post(self.tag, "scan", ("额外", self.n_base + n)))
-                    self.n_extra = len(more)
+                                          lambda n: post(self.tag, "scan", ("额外", n_base + n)))
+                    n_extra = len(more)
                     rows += more
                     for k, v in sk2.items():
                         skipped[k] = skipped.get(k, 0) + v
@@ -259,11 +267,18 @@ class CheckerPage(PageBase):
                                             lambda d, t: post(self.tag, "hash", (d, t)),
                                             stat=stat)
                     skipped.update(stat)
-                post(self.tag, "done", (groups, skipped, only_extra, bool(extra)))
+                post(self.tag, "done",
+                     (groups, skipped, only_extra, bool(extra), n_base, n_extra))
             except Exception:
                 post(self.tag, "error", traceback.format_exc())
 
-        threading.Thread(target=work, daemon=True).start()
+        try:
+            threading.Thread(target=work, daemon=True).start()
+        except Exception as e:
+            self.app.release()
+            self.app.progress_done()
+            self._log("[x] 无法启动扫描线程：%s" % e)
+            self.app.mb.showerror(APP, "无法启动扫描线程：\n%s" % e)
 
     def _stop(self):
         if self.app.busy:
@@ -295,10 +310,13 @@ class CheckerPage(PageBase):
             self.app.mb.showerror(APP, payload)
             self.app.set_status("出错：" + payload.splitlines()[-1])
 
-    def _render(self, groups, skipped, only_extra, has_extra):
+    def _render(self, groups, skipped, only_extra, has_extra, n_base, n_extra):
         self.app.release()
+        self.n_base = n_base
+        self.n_extra = n_extra
         self.groups = groups
         self._reset_sel()
+        items = []
         for gi, g in enumerate(groups):
             tag = "even" if gi % 2 == 0 else "odd"
             for i, m in enumerate(g["members"]):
@@ -308,17 +326,18 @@ class CheckerPage(PageBase):
                     mark = "–"
                 else:
                     mark = "☑" if m["checked"] else "☐"
-                self.tree.insert("", "end", iid=m["path"], values=(
+                items.append((m["path"], (
                     mark, "基础" if m["src"] == SRC_BASE else "额外",
                     len(g["members"]) if i == 0 else "",
                     human_size(g["size"]) if i == 0 else "",
                     g["hash"] if i == 0 else "", m["path"],
-                ), tags=(tag,))
+                ), tag))
         waste = self._sel_size
         used = time.time() - self.started
         skip_txt = "，".join(f"{k} {v}" for k, v in sorted(skipped.items()))
         stopped = "（已停止，结果不完整）" if self.app.stop.is_set() else ""
-        mode = "仅比对额外目录" if only_extra else "全量去重"
+        mode = ("仅比对额外目录" if only_extra else
+                ("基础目录去重" if not has_extra else "全量去重"))
         self.app.progress_done()
         self.app.set_status(f"完成{stopped}：基础 {self.n_base} 个 / 额外 {self.n_extra} 个文件，"
                             f"耗时 {used:.1f}s，{mode}，算法 {self.app.var_algo.get()}")
@@ -337,6 +356,20 @@ class CheckerPage(PageBase):
         if not groups:
             hint = "未发现基础目录与额外目录重复的文件" if has_extra else "未发现重复文件"
             self.app.set_status(f"{hint}{stopped}")
+        self._render_token = getattr(self, "_render_token", 0) + 1
+        token = self._render_token
+        self.tree.delete(*self.tree.get_children())
+        self._insert_items(items, 0, token)
+
+    def _insert_items(self, items, start, token):
+        """分批插表，几万行也不会一次性卡死界面。"""
+        if token != self._render_token:
+            return
+        end = min(start + 400, len(items))
+        for iid, values, tag in items[start:end]:
+            self.tree.insert("", "end", iid=iid, values=values, tags=(tag,))
+        if end < len(items):
+            self.frame.after(1, lambda: self._insert_items(items, end, token))
 
     def _default_out(self, base):
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -418,6 +451,15 @@ class CheckerPage(PageBase):
             self.app.mb.showwarning(APP, "请先指定待移除目录")
             return
         dst = os.path.abspath(dst)
+        created = not os.path.isdir(dst)
+
+        def drop_created():
+            if created:
+                try:
+                    os.rmdir(dst)
+                except OSError:
+                    pass
+
         try:
             os.makedirs(long_path(dst), exist_ok=True)
         except OSError as e:
@@ -427,6 +469,7 @@ class CheckerPage(PageBase):
         problems = preflight(dst, [("基础目录", base), ("额外目录", extra)],
                              dst_label="待移除目录", must_be_empty=True, need_bytes=need)
         if problems:
+            drop_created()
             self.app.mb.showerror(APP, "以下问题会阻止执行：\n\n· " + "\n· ".join(problems))
             return
         n = sum(len(p["moves"]) for p in plan)
@@ -436,8 +479,10 @@ class CheckerPage(PageBase):
                f"· 每组复制一份保留件到组目录，供人工对比（占用 {human_size(copy_size)}）\n"
                f"· 需要空间约 {human_size(need)}\n\n⚠️ 确认继续？")
         if not self.app.mb.askyesno("确认移除", msg, icon="warning"):
+            drop_created()
             return
         if not self.app.acquire(self):
+            drop_created()
             return
         only_extra = bool(snap["only"]) and bool(extra)
         self._log("[i] 开始移除：%d 个文件 → %s" % (n, dst))
@@ -457,7 +502,13 @@ class CheckerPage(PageBase):
             except Exception:
                 post(self.tag, "error", traceback.format_exc())
 
-        threading.Thread(target=work, daemon=True).start()
+        try:
+            threading.Thread(target=work, daemon=True).start()
+        except Exception as e:
+            self.app.release()
+            self.app.progress_done()
+            self._log("[x] 无法启动移除线程：%s" % e)
+            self.app.mb.showerror(APP, "无法启动移除线程：\n%s" % e)
 
     def _removed(self, r):
         self.app.release()
@@ -472,10 +523,18 @@ class CheckerPage(PageBase):
         self._log("[OK] 移除完成：成功 %d，失败 %d，未尝试 %d，保留件副本 %d%s"
                   % (r["ok"], r["fail"], r.get("skipped", 0), r["copied"],
                      "（已中断）" if r["stopped"] else ""))
-        self.stats.config(text=f"清单已写入 {os.path.join(self.var_out.get(), '清单.txt')}"
-                               f"　|　对比完成后可手动删除整个待移除目录")
+        if r.get("manifest_error"):
+            self.stats.config(text="清单写入失败：%s　|　移动结果见上方日志"
+                                   % r["manifest_error"])
+            self.app.mb.showwarning(APP, "文件移动已完成，但清单写入失败：\n%s\n\n"
+                                          "请到待移除目录查看；本次明细见日志。"
+                                          % r["manifest_error"])
+        else:
+            self.stats.config(text=f"清单已写入 {r.get('manifest')}"
+                                   f"　|　对比完成后可手动删除整个待移除目录")
         if r["fail"]:
-            self.app.mb.showwarning(APP, f"有 {r['fail']} 个文件移动失败，详见 清单.txt")
+            self.app.mb.showwarning(APP, f"有 {r['fail']} 个文件移动失败，详见 "
+                                          f"{r.get('manifest') or '待移除目录'}")
 
     def _open_location(self, _ev=None):
         sel = self.tree.selection()

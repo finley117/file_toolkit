@@ -12,7 +12,7 @@ import traceback
 import config
 import photo_media
 from checker_page import CheckerPage
-from common import ALGOS, APP, DEFAULT_ALGO, VER, benchmark_algo
+from common import ALGOS, APP, BENCH_MB, DEFAULT_ALGO, VER, benchmark_all
 from dedup_page import DedupPage
 from media_page import MediaPage
 from photo_page import PhotoPage
@@ -77,7 +77,15 @@ class App:
         config.set_value(self.cfg, "app.ffprobe_path", self.var_ffprobe.get().strip())
         for page in self.pages.values():
             page.save_cfg()
-        config.save(self.cfg)
+        ok = config.save(self.cfg)
+        if not ok:
+            self.set_status("配置保存失败：程序目录可能没有写权限")
+            try:
+                self.mb.showwarning(APP, "配置保存失败：程序目录可能没有写权限，\n"
+                                          "本次设置不会被记住。")
+            except Exception:
+                pass
+        return ok
 
     def _on_close(self):
         try:
@@ -220,7 +228,6 @@ class App:
             self.pb.stop()
             self.pb.config(mode="determinate")
             self.pb["value"] = 100
-        self.chk.btn_stop.config(state="disabled")
 
     def set_status(self, text):
         self.lbl.config(text=text)
@@ -244,13 +251,12 @@ class App:
         self.pb["value"] = 100
 
     def _bench(self):
-        global _bench_buf
         ttk, tk = self.ttk, self.tk
         win = tk.Toplevel(self.root)
         win.title("算法性能测试")
         win.geometry("460x320")
         win.transient(self.root)
-        ttk.Label(win, text=f"用 {_BENCH_MB} MB 内存数据测纯 CPU 吞吐（不含磁盘 I/O）",
+        ttk.Label(win, text=f"用 {BENCH_MB} MB 内存数据测纯 CPU 吞吐（不含磁盘 I/O）",
                   padding=10).pack(fill="x")
         tv = ttk.Treeview(win, columns=("algo", "speed"), show="headings", height=8)
         tv.heading("algo", text="算法")
@@ -264,13 +270,8 @@ class App:
         win.bind("<Destroy>", lambda _e: alive.__setitem__("ok", False))
 
         def run():
-            global _bench_buf
-            if _bench_buf is None:
-                _bench_buf = os.urandom(_BENCH_MB * 1024 * 1024)
-            results = []
-            for name in ALGOS:
-                mb = benchmark_algo(name)
-                results.append((name, mb))
+            results = benchmark_all()
+            for name, mb in results:
                 self.root.after(0, lambda n=name, m=mb: alive["ok"] and tv.insert(
                     "", "end", iid=n, values=(n, f"{m:,.0f} MB/s")))
             best = max(results, key=lambda x: x[1])[0]
